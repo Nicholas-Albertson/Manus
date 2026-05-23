@@ -1,4 +1,5 @@
-export async function webSearch(query: string): Promise<string> {
+export async function webSearch(args: { query: string }): Promise<string> {
+  const query = args.query;
   // Use Serper API if key is present, otherwise return simulated result
   const SERPER_API_KEY = process.env.SERPER_API_KEY;
   if (SERPER_API_KEY) {

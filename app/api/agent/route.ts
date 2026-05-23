@@ -8,6 +8,16 @@ export const maxDuration = 60;
 
 export async function POST(req: NextRequest) {
   try {
+    if (!process.env.OPENAI_API_KEY) {
+      return NextResponse.json(
+        {
+          error:
+            "Missing OPENAI_API_KEY. Set it in your environment (e.g. .env.local) before starting a task.",
+        },
+        { status: 500 }
+      );
+    }
+
     const { userInput } = await req.json();
     if (!userInput) {
       return NextResponse.json({ error: "Missing userInput" }, { status: 400 });

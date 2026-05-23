@@ -1,17 +1,30 @@
 import fs from "fs/promises";
+import path from "path";
 
-export async function readFile(filePath: string): Promise<string> {
+function resolveTaskPath(taskId: string, filePath: string): string {
+  const taskRoot = path.join("/tmp", "tasks_data", taskId);
+  const resolved = path.resolve(taskRoot, filePath);
+  const relative = path.relative(taskRoot, resolved);
+  if (relative.startsWith("..") || path.isAbsolute(relative)) {
+    throw new Error("Path must stay within the task workspace");
+  }
+  return resolved;
+}
+
+export async function readFile(args: { taskId: string; filePath: string }): Promise<string> {
   try {
-    return await fs.readFile(filePath, "utf-8");
+    const resolved = resolveTaskPath(args.taskId, args.filePath);
+    return await fs.readFile(resolved, "utf-8");
   } catch (err) {
     return `Error reading file: ${err}`;
   }
 }
 
-export async function writeFile(filePath: string, content: string): Promise<string> {
+export async function writeFile(args: { taskId: string; filePath: string; content: string }): Promise<string> {
   try {
-    await fs.writeFile(filePath, content);
-    return `File written successfully to ${filePath}`;
+    const resolved = resolveTaskPath(args.taskId, args.filePath);
+    await fs.writeFile(resolved, args.content);
+    return `File written successfully to ${args.filePath}`;
   } catch (err) {
     return `Error writing file: ${err}`;
   }
