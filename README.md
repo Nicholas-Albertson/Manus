@@ -1,4 +1,4 @@
-# Manus (JS) — Working Prototype
+# Taskflow (JS) — Working Prototype
 
 This is a minimal Manus-style agent prototype built with Next.js (App Router) + LangChain/LangGraph.
 
