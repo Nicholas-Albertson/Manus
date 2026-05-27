@@ -15,7 +15,7 @@ export class MemoryFileManager {
 
   async writePlan(steps: string[]) {
     let content = "# Task Plan\n\n";
-    steps.forEach((step, i) => {
+    steps.forEach((step) => {
       content += `- [ ] ${step}\n`;
     });
     await fs.writeFile(path.join(this.taskDir, "task_plan.md"), content);
