@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { v4 as uuidv4 } from "uuid";
-import { agentApp } from "../../../lib/agent/graph";
+import { agentApp, RECURSION_LIMIT } from "../../../lib/agent/graph";
 import { AgentState } from "../../../lib/agent/state";
 import { taskStore } from "../../../lib/store";
 
@@ -19,8 +19,14 @@ export async function POST(req: NextRequest) {
     }
 
     const { userInput } = await req.json();
-    if (!userInput) {
+    if (typeof userInput !== "string" || !userInput.trim()) {
       return NextResponse.json({ error: "Missing userInput" }, { status: 400 });
+    }
+    if (userInput.length > 4000) {
+      return NextResponse.json(
+        { error: "userInput is too long (max 4000 characters)" },
+        { status: 400 }
+      );
     }
 
     const taskId = uuidv4();
@@ -31,12 +37,13 @@ export async function POST(req: NextRequest) {
       userInput,
       plan: [],
       currentStepIndex: 0,
+      stepAttempts: 0,
       findings: [],
       toolCalls: [],
       messages: [],
     };
 
-    agentApp.invoke(initialState).catch((err) => {
+    agentApp.invoke(initialState, { recursionLimit: RECURSION_LIMIT }).catch((err) => {
       console.error(`Agent error for task ${taskId}:`, err);
       taskStore.set(taskId, "failed");
     });

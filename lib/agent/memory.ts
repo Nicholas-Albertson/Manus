@@ -51,6 +51,10 @@ export class MemoryFileManager {
     }
   }
 
+  async writeSummary(content: string) {
+    await fs.writeFile(path.join(this.taskDir, "summary.md"), content);
+  }
+
   async appendFinding(finding: string) {
     const timestamp = new Date().toISOString();
     await fs.appendFile(
@@ -69,7 +73,7 @@ export class MemoryFileManager {
 
   async getAllFiles() {
     const files: Record<string, string> = {};
-    for (const name of ["task_plan.md", "findings.md", "progress.md"]) {
+    for (const name of ["task_plan.md", "findings.md", "progress.md", "summary.md"]) {
       try {
         files[name] = await fs.readFile(path.join(this.taskDir, name), "utf-8");
       } catch {
