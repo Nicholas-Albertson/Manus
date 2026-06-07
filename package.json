@@ -13,6 +13,7 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@e2b/code-interpreter": "^2.6.0",
     "@langchain/core": "1.1.48",
     "@langchain/langgraph": "1.3.2",
     "@langchain/openai": "1.4.7",

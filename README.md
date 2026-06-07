@@ -74,8 +74,9 @@ calls per run — no runaway loops or surprise bills.
   it on a persistent disk to retain history across restarts.
 - Without `SERPER_API_KEY`, `web_search` returns a simulated result (no network
   call), so the prototype runs end-to-end without it.
-- The included `execute_python` tool is intentionally a stub (no arbitrary code
-  execution). Wire a real sandbox (e.g. E2B or Daytona) to enable it.
+- `execute_python` is an env-gated opt-in: set `E2B_API_KEY` to run code in an
+  isolated [E2B](https://e2b.dev) cloud sandbox; without it the tool returns a
+  safe stub (no in-process code execution).
 - Deploying to fully serverless environments (where background work is frozen
   after the response) will require a queue/worker; this prototype targets a
   long-running Node server (local/Docker/VM).

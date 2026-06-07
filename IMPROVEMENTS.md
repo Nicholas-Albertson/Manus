@@ -11,11 +11,11 @@ loop/cost + verification + final-output cluster). Everything else is open.
 
 ## 1. Code review findings
 
-> **Progress:** 22 of 26 findings done or partially done. Remaining open:
-> #6 (full multi-instance durability — partial; status now persisted), #16
-> (real `execute_python` sandbox), and `strict: true` (deferred under #4 due
-> to LangGraph generics). Highest remaining value: a real sandbox and a
-> queue/worker for true multi-instance durability.
+> **Progress:** 23 of 26 findings done or partially done. Remaining open:
+> #6 (full multi-instance durability — partial; status now persisted) and
+> `strict: true` (deferred under #4 due to LangGraph generics). Highest
+> remaining value: a queue/worker for true multi-instance durability, and a
+> live end-to-end run once an `OPENAI_API_KEY` is configured as a secret.
 
 ### 🔴 High priority — bugs & security
 
@@ -69,8 +69,11 @@ loop/cost + verification + final-output cluster). Everything else is open.
     **✅ partial** (package name left as-is to avoid churn).
 15. **Stale Vercel comments** contradict the README — cleaned up in `store.ts`
     and `memory.ts`. **✅ Done**.
-16. **`execute_python` is a permanent stub** — _open: wire a real sandbox
-    (see §2) or drop it from the advertised tool list._
+16. **`execute_python` was a permanent stub** — now an env-gated opt-in: with
+    `E2B_API_KEY` set it runs code in an isolated E2B cloud sandbox; without it,
+    it falls back to the safe stub. **✅ Done** (live path requires an E2B key
+    to exercise; the fallback is unit-tested). _Daytona remains an alternative
+    if self-hosting is preferred._
 17. **Missing `LICENSE`** — added MIT `LICENSE`; README now documents the
     `SERPER_API_KEY` fallback and a full scripts table. **✅ Done**.
 18. **Unbounded plan crashed the graph** — default `recursionLimit` (25) threw
