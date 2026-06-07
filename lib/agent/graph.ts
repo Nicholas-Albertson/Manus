@@ -1,7 +1,7 @@
 import { StateGraph, END, START } from "@langchain/langgraph";
 import { ChatOpenAI } from "@langchain/openai";
 import { HumanMessage, SystemMessage } from "@langchain/core/messages";
-import { AgentState } from "./state";
+import { AgentAnnotation, type AgentState } from "./state";
 import { MemoryFileManager } from "./memory";
 import { buildTools, TOOL_NAMES } from "./tools";
 import { taskStore } from "../store";
@@ -229,20 +229,7 @@ function routeAfterStep(state: AgentState): "execution" | "summary" {
   return "summary";
 }
 
-const workflow = new StateGraph<AgentState>({
-  channels: {
-    taskId: { value: (a, b) => b ?? a },
-    userInput: { value: (a, b) => b ?? a },
-    plan: { value: (a, b) => b ?? a },
-    currentStepIndex: { value: (a, b) => b ?? a },
-    stepAttempts: { value: (a, b) => b ?? a },
-    findings: { value: (a, b) => a.concat(b) },
-    toolCalls: { value: (a, b) => a.concat(b) },
-    finalOutput: { value: (a, b) => b ?? a },
-    error: { value: (a, b) => b ?? a },
-    messages: { value: (a, b) => a.concat(b) },
-  },
-})
+const workflow = new StateGraph(AgentAnnotation)
   .addNode("planning", planningNode)
   .addNode("execution", executionNode)
   .addNode("verification", verificationNode)

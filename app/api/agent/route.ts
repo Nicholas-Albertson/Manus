@@ -49,6 +49,8 @@ export async function POST(req: NextRequest) {
       findings: [],
       toolCalls: [],
       messages: [],
+      finalOutput: undefined,
+      error: undefined,
     };
 
     agentApp

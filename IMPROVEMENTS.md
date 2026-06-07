@@ -11,11 +11,11 @@ loop/cost + verification + final-output cluster). Everything else is open.
 
 ## 1. Code review findings
 
-> **Progress:** 23 of 26 findings done or partially done. Remaining open:
-> #6 (full multi-instance durability — partial; status now persisted) and
-> `strict: true` (deferred under #4 due to LangGraph generics). Highest
-> remaining value: a queue/worker for true multi-instance durability, and a
-> live end-to-end run once an `OPENAI_API_KEY` is configured as a secret.
+> **Progress:** 24 of 26 findings done or partially done. The only substantive
+> item remaining is #6 (full multi-instance durability — status is persisted,
+> but a queue/worker is still needed and requires external infra to build and
+> verify). A live end-to-end run is also pending an `OPENAI_API_KEY` secret in
+> a fresh session.
 
 ### 🔴 High priority — bugs & security
 
@@ -29,9 +29,9 @@ loop/cost + verification + final-output cluster). Everything else is open.
 3. **Wrong variable in finding log** — interpolated a raw object
    (`[object Object]`); now uses the stringified result. **✅ Done**.
 4. **Duplicate/typo config `tsconfg.json`** — deleted; `moduleResolution`
-   aligned to Next's recommended `bundler`. **✅ Done** (note: `strict: true`
-   deferred — LangGraph 1.x channel generics clash with strict in `graph.ts`,
-   tracked as follow-up).
+   aligned to Next's recommended `bundler`; **`strict: true` now enabled** —
+   migrated the agent state to LangGraph's typed `Annotation` API so the
+   channels/reducers/node returns type-check cleanly. **✅ Done**.
 5. **Stray junk file `public/N`** — removed; replaced with a real
    `public/robots.txt`. **✅ Done**.
 
@@ -93,8 +93,9 @@ loop/cost + verification + final-output cluster). Everything else is open.
 24. **Accessibility gaps** — labeled textarea, `aria-live` status region,
     `role="progressbar"` on the plan bar, `role="alert"` errors, keyboard
     submit (⌘/Ctrl+Enter). **✅ Done**.
-25. **`tsconfig` drift** — resolved by deleting the typo file and setting
-    `moduleResolution: bundler`. **✅ Done** (`strict` deferred, see #4).
+25. **`tsconfig` drift** — resolved by deleting the typo file, setting
+    `moduleResolution: bundler`, and enabling `strict: true` (see #4).
+    **✅ Done**.
 26. **No `metadataBase`** in `layout.tsx` — added, with full OpenGraph/title
     template metadata and a `viewport` export. **✅ Done**.
 
