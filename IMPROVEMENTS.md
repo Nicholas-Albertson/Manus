@@ -51,7 +51,8 @@ loop/cost + verification + final-output cluster). Everything else is open.
     error banner + final-output panel. **✅ Done** (`app/page.tsx`).
 13. **No CI** — _open: GitHub Actions running `lint` + `build` (+ tests)._
 14. **Inconsistent naming** — `manus-js-clone` vs "Taskflow" vs "Manus Clone".
-    _Open: pick one._
+    User-facing surfaces standardized on **Taskflow** (layout metadata + UI).
+    **✅ partial** (package name left as-is to avoid churn).
 15. **Stale Vercel comments** contradict the README. _Open: clean up._
 16. **`execute_python` is a permanent stub** — _open: wire a real sandbox
     (see §2) or drop it from the advertised tool list._
@@ -62,18 +63,33 @@ loop/cost + verification + final-output cluster). Everything else is open.
     `MAX_STEP_ATTEMPTS`, and a computed `RECURSION_LIMIT`. **✅ Done**.
 19. **Final output was never produced** — `finalOutput` was declared but never
     written. Added a synthesis node that emits an executive summary to
-    `summary.md` and the UI. **✅ Done**.
-20. **Dead code in `memory.ts`** — `readPlan()` / `getAllFiles()` unused.
-    _Open: remove or wire up._
-21. **Chatty polling (N+1)** — UI fires 4+ requests every 2s. _Open:
-    consolidate into one status+docs endpoint; consider streaming._
+    `summary.md` and the UI (now rendered as markdown). **✅ Done**.
+20. **Dead code in `memory.ts`** — `getAllFiles()` now backs the aggregated
+    state endpoint. **✅ partial** (`readPlan()` still unused).
+21. **Chatty polling (N+1)** — replaced 4–5 requests/tick with a single
+    `GET /api/agent/[taskId]` returning status + all docs. **✅ Done**
+    (streaming still a future option).
 22. **Drop the `uuid` dependency** — Node 20 has `crypto.randomUUID()`. _Open._
 23. **No `engines` field** in `package.json`. _Open: `"node": ">=20"`._
-24. **Accessibility gaps** — unlabeled textarea, emoji-only headings, status
-    badge not announced. _Open (error banner now uses `role="alert"`)._
+24. **Accessibility gaps** — labeled textarea, `aria-live` status region,
+    `role="progressbar"` on the plan bar, `role="alert"` errors, keyboard
+    submit (⌘/Ctrl+Enter). **✅ Done**.
 25. **`tsconfig` drift** — `moduleResolution` differs between the two files;
     Next recommends `bundler`. _Open (folds into #4)._
-26. **No `metadataBase`** in `layout.tsx`. _Open._
+26. **No `metadataBase`** in `layout.tsx` — added, with full OpenGraph/title
+    template metadata and a `viewport` export. **✅ Done**.
+
+### Site / frontend overhaul (this pass)
+- Full visual redesign: sticky header + branding, gradient hero, composer with
+  example chips, char counter, and keyboard submit.
+- **Markdown rendering** of the final output and findings via `react-markdown`
+  + `remark-gfm` + `@tailwindcss/typography` (replacing raw `<pre>` dumps).
+- **Parsed plan checklist** with a live progress bar (driven by the
+  `- [x]` / `- [ ]` markers the agent writes).
+- Tabbed Findings / Progress activity panel, status pill with animated live
+  indicator, loading/empty states, and Copy / Download for the result.
+- Refined dark theme, custom scrollbars, system font stack (no external font
+  fetch, keeping the build hermetic).
 
 ---
 
