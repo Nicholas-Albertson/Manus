@@ -2,7 +2,7 @@ import fs from "fs/promises";
 import path from "path";
 import { z } from "zod";
 
-function resolveTaskPath(taskId: string, filePath: string): string {
+export function resolveTaskPath(taskId: string, filePath: string): string {
   const taskRoot = path.join("/tmp", "tasks_data", taskId);
   const resolved = path.resolve(taskRoot, filePath);
   const relative = path.relative(taskRoot, resolved);

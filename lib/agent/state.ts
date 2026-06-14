@@ -14,6 +14,8 @@ export interface AgentState {
   userInput: string;
   plan: string[];
   currentStepIndex: number;
+  /** Number of failed attempts for the current step (drives bounded retry). */
+  stepAttempts: number;
   findings: string[];
   toolCalls: ToolCall[];
   finalOutput?: string;
