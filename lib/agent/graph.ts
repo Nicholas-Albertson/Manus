@@ -26,7 +26,7 @@ function getLlm() {
 }
 
 /** Safely coerce a LangChain message content (string | parts[]) to text. */
-function asText(content: unknown): string {
+export function asText(content: unknown): string {
   if (typeof content === "string") return content;
   if (Array.isArray(content)) {
     return content
@@ -40,6 +40,85 @@ function asText(content: unknown): string {
       .join("");
   }
   return content == null ? "" : String(content);
+}
+
+// --- Pure parsing/decision helpers ----------------------------------------
+// Extracted from the graph nodes so the brittle, bug-prone bits (LLM output
+// parsing, verdict interpretation, bounded-retry bookkeeping) can be unit
+// tested deterministically without invoking an LLM.
+
+/**
+ * Parse the planner's free-text response into a bounded list of steps.
+ * Keeps only dash-prefixed lines, strips the marker, drops blanks, and caps
+ * the count at `max` so a runaway plan can never exceed the guardrail.
+ */
+export function parsePlan(content: string, max: number = MAX_PLAN_STEPS): string[] {
+  return content
+    .split("\n")
+    .filter((line) => line.trim().startsWith("-"))
+    .map((line) => line.replace(/^-\s*/, "").trim())
+    .filter((line) => line.length > 0)
+    .slice(0, max);
+}
+
+export type ParsedToolCall =
+  | { kind: "tool"; tool: string; arguments: Record<string, unknown> }
+  | { kind: "text" };
+
+/**
+ * Interpret an execution-agent response as either a tool call or plain text.
+ * Tolerates a fenced ```json block, returns `text` for malformed JSON, a
+ * missing `tool` field, or an unknown tool name.
+ */
+export function parseToolCall(
+  content: string,
+  toolRegistry: Record<string, unknown> = tools
+): ParsedToolCall {
+  try {
+    const json = content.replace(/^```(?:json)?\s*|\s*```$/g, "").trim();
+    const data = JSON.parse(json);
+    if (data && data.tool && toolRegistry[data.tool]) {
+      const args =
+        data.arguments && typeof data.arguments === "object" ? data.arguments : {};
+      return { kind: "tool", tool: data.tool, arguments: args };
+    }
+    return { kind: "text" };
+  } catch {
+    return { kind: "text" };
+  }
+}
+
+/** A verdict is a success only if its leading token is SUCCESS. */
+export function parseVerdict(content: string): boolean {
+  return content.trim().toUpperCase().startsWith("SUCCESS");
+}
+
+export type VerificationOutcome = "advance" | "retry" | "skip";
+
+export interface VerificationDecision {
+  outcome: VerificationOutcome;
+  currentStepIndex: number;
+  stepAttempts: number;
+}
+
+/**
+ * Bounded retry-then-skip policy. On success, advance and reset attempts. On
+ * failure, retry the same step until `MAX_STEP_ATTEMPTS` is reached, then skip
+ * it so a single hard step can never stall the whole run.
+ */
+export function decideVerification(
+  success: boolean,
+  currentStepIndex: number,
+  stepAttempts: number
+): VerificationDecision {
+  if (success) {
+    return { outcome: "advance", currentStepIndex: currentStepIndex + 1, stepAttempts: 0 };
+  }
+  const attempts = stepAttempts + 1;
+  if (attempts < MAX_STEP_ATTEMPTS) {
+    return { outcome: "retry", currentStepIndex, stepAttempts: attempts };
+  }
+  return { outcome: "skip", currentStepIndex: currentStepIndex + 1, stepAttempts: 0 };
 }
 
 async function planningNode(state: AgentState): Promise<Partial<AgentState>> {
@@ -56,12 +135,7 @@ async function planningNode(state: AgentState): Promise<Partial<AgentState>> {
   );
   const response = await llm.invoke([system, new HumanMessage(state.userInput)]);
   const content = asText(response.content);
-  const lines = content
-    .split("\n")
-    .filter(line => line.trim().startsWith("-"))
-    .map(line => line.replace(/^-\s*/, "").trim())
-    .filter(line => line.length > 0)
-    .slice(0, MAX_PLAN_STEPS);
+  const lines = parsePlan(content, MAX_PLAN_STEPS);
 
   await memory.writePlan(lines);
   await memory.logProgress("Planning completed", `${lines.length} steps generated`);
@@ -101,22 +175,20 @@ async function executionNode(state: AgentState): Promise<Partial<AgentState>> {
 
   let toolCall;
   let resultText = "";
-  try {
-    // Tolerate a fenced ```json block around the tool call.
-    const json = content.replace(/^```(?:json)?\s*|\s*```$/g, "").trim();
-    const data = JSON.parse(json);
-    if (data.tool && tools[data.tool]) {
-      const args = { taskId: state.taskId, ...(data.arguments || {}) };
-      const result = await tools[data.tool](args);
+  const parsed = parseToolCall(content, tools);
+  if (parsed.kind === "tool") {
+    try {
+      const args = { taskId: state.taskId, ...parsed.arguments };
+      const result = await tools[parsed.tool](args);
       resultText = typeof result === "string" ? result : JSON.stringify(result);
       toolCall = {
-        toolName: data.tool,
+        toolName: parsed.tool,
         arguments: args,
         result,
         timestamp: new Date(),
       };
-      await memory.appendFinding(`Tool ${data.tool} result: ${resultText}`);
-    } else {
+      await memory.appendFinding(`Tool ${parsed.tool} result: ${resultText}`);
+    } catch {
       toolCall = {
         toolName: "llm_response",
         arguments: { response: content },
@@ -126,7 +198,7 @@ async function executionNode(state: AgentState): Promise<Partial<AgentState>> {
       resultText = content;
       await memory.appendFinding(`Step ${state.currentStepIndex + 1}: ${content}`);
     }
-  } catch {
+  } else {
     toolCall = {
       toolName: "llm_response",
       arguments: { response: content },
@@ -160,41 +232,31 @@ async function verificationNode(state: AgentState): Promise<Partial<AgentState>>
   ]);
   const verdict = asText(response.content);
   // Objective parse: look at the leading token, not a substring match anywhere.
-  const leading = verdict.trim().toUpperCase();
-  const success = leading.startsWith("SUCCESS");
+  const success = parseVerdict(verdict);
+  const decision = decideVerification(
+    success,
+    state.currentStepIndex,
+    state.stepAttempts
+  );
 
-  if (success) {
+  if (decision.outcome === "advance") {
     await memory.checkOffStep(state.currentStepIndex);
     await memory.logProgress(`Step ${state.currentStepIndex + 1} verified`, "SUCCESS");
-    return {
-      currentStepIndex: state.currentStepIndex + 1,
-      stepAttempts: 0,
-      messages: [response],
-    };
-  }
-
-  // Failure: retry the same step up to MAX_STEP_ATTEMPTS, then skip and move on
-  // so a single hard step can never stall the whole run.
-  const attempts = state.stepAttempts + 1;
-  if (attempts < MAX_STEP_ATTEMPTS) {
+  } else if (decision.outcome === "retry") {
     await memory.logProgress(
       `Step ${state.currentStepIndex + 1} verification`,
-      `FAILURE (will retry, attempt ${attempts}/${MAX_STEP_ATTEMPTS}): ${verdict}`
+      `FAILURE (will retry, attempt ${decision.stepAttempts}/${MAX_STEP_ATTEMPTS}): ${verdict}`
     );
-    return {
-      currentStepIndex: state.currentStepIndex,
-      stepAttempts: attempts,
-      messages: [response],
-    };
+  } else {
+    await memory.logProgress(
+      `Step ${state.currentStepIndex + 1} verification`,
+      `FAILURE (max attempts reached, skipping): ${verdict}`
+    );
   }
 
-  await memory.logProgress(
-    `Step ${state.currentStepIndex + 1} verification`,
-    `FAILURE (max attempts reached, skipping): ${verdict}`
-  );
   return {
-    currentStepIndex: state.currentStepIndex + 1,
-    stepAttempts: 0,
+    currentStepIndex: decision.currentStepIndex,
+    stepAttempts: decision.stepAttempts,
     messages: [response],
   };
 }
@@ -231,7 +293,7 @@ async function summaryNode(state: AgentState): Promise<Partial<AgentState>> {
   return { finalOutput };
 }
 
-function routeAfterStep(state: AgentState): "execution" | "summary" {
+export function routeAfterStep(state: AgentState): "execution" | "summary" {
   if (state.currentStepIndex < state.plan.length) {
     return "execution";
   }

@@ -28,12 +28,16 @@ export class MemoryFileManager {
       const lines = content.split("\n");
       let count = 0;
       const newLines = lines.map(line => {
-        if (line.startsWith("- [ ]")) {
-          if (count === stepIndex) {
-            count++;
+        // Count every step line (checked or not) so the index→line mapping
+        // stays stable as earlier steps get checked off across calls.
+        const isStepLine =
+          line.startsWith("- [ ]") || line.startsWith("- [x]");
+        if (isStepLine) {
+          const isMatch = count === stepIndex;
+          count++;
+          if (isMatch && line.startsWith("- [ ]")) {
             return line.replace("[ ]", "[x]");
           }
-          count++;
         }
         return line;
       });
