@@ -39,6 +39,8 @@
     },
     "@langchain/langgraph-checkpoint": {
       "uuid": "11.1.1"
-    }
+    },
+    "postcss": "$postcss",
+    "esbuild": "^0.28.1"
   }
 }
