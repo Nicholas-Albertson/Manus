@@ -1,5 +1,27 @@
-export async function webSearch(args: { query: string }): Promise<string> {
-  const query = args.query;
+import { z } from "zod";
+
+const webSearchArgsSchema = z.object({
+  query: z.string().min(1),
+});
+
+const serperResponseSchema = z.object({
+  organic: z
+    .array(
+      z.object({
+        title: z.string().optional(),
+        snippet: z.string().optional(),
+      })
+    )
+    .optional(),
+});
+
+export async function webSearch(args: unknown): Promise<string> {
+  const parsedArgs = webSearchArgsSchema.safeParse(args);
+  if (!parsedArgs.success) {
+    return "Error: web_search expects { query: string }";
+  }
+
+  const query = parsedArgs.data.query;
   // Use Serper API if key is present, otherwise return simulated result
   const SERPER_API_KEY = process.env.SERPER_API_KEY;
   if (SERPER_API_KEY) {
@@ -12,8 +34,16 @@ export async function webSearch(args: { query: string }): Promise<string> {
         },
         body: JSON.stringify({ q: query }),
       });
-      const data = await response.json();
-      const results = data.organic?.slice(0, 3).map((r: any) => `${r.title}: ${r.snippet}`).join("\n");
+      const data: unknown = await response.json();
+      const parsed = serperResponseSchema.safeParse(data);
+      if (!parsed.success) {
+        return "Search failed due to an unexpected response shape.";
+      }
+
+      const results = parsed.data.organic
+        ?.slice(0, 3)
+        .map((r) => `${r.title ?? "Result"}: ${r.snippet ?? ""}`.trim())
+        .join("\n");
       return results || "No search results found.";
     } catch (err) {
       console.error("Search error:", err);
