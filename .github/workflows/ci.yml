@@ -1,0 +1,29 @@
+name: CI
+
+# Quality gate: run on every pull request and on pushes to main. The existing
+# Pages deploy workflow only builds on main and never runs tests/lint, so this
+# is what actually guards the default branch and incoming PRs.
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Lint
+        run: npm run lint
+      - name: Type-check
+        run: npx tsc --noEmit
+      - name: Test
+        run: npm test
