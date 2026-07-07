@@ -4,22 +4,25 @@ A consolidated, prioritized backlog for this Manus-style agent prototype
 (Next.js App Router + LangChain/LangGraph), produced from a full code review
 plus competitive research of the 2026 autonomous-agent landscape.
 
-Items marked **✅ Done** were implemented across two hardening passes: the
-first (loop/cost + verification + final-output cluster), and a second
+Items marked **✅ Done** were implemented across three hardening passes: the
+first (loop/cost + verification + final-output cluster), the second
 (durability, rate limiting, cost visibility, human-in-the-loop, multi-model —
-see "Robustness & durability pass" below). Everything else is open.
+"Robustness & durability pass"), and the third ("Batch D pass": persistent
+checkpointer, streaming, findings-in-context). Everything else is open.
 
 ---
 
 ## 1. Code review findings
 
-> **Progress:** 26 of 26 findings done or partially done. #6 (durability) now
-> has a real queue/worker option (verified end-to-end against a live Redis +
-> BullMQ worker + a real OpenAI auth-failure round trip); the remaining gap is
-> a persistent LangGraph checkpointer for multi-instance plan-approval resume
-> (currently in-memory, see the Robustness pass below). A live end-to-end
-> *successful* run (not just the auth-failure round trip) is still pending a
-> real `OPENAI_API_KEY`/`ANTHROPIC_API_KEY` secret in a fresh session.
+> **Progress:** 26 of 26 findings done. #6 (durability) now has both a real
+> queue/worker option and a persistent (SQLite) LangGraph checkpoint, so a
+> paused or in-flight task survives a process restart and can be resumed by
+> a different worker than the one that paused it — verified end-to-end
+> against a live Redis + BullMQ worker (real OpenAI auth-failure round trip)
+> and against a freshly-reimported graph module standing in for a process
+> restart (`tests/graph.test.ts`). A live end-to-end *successful* run (not
+> just the auth-failure round trip) is still pending a real
+> `OPENAI_API_KEY`/`ANTHROPIC_API_KEY` secret in a fresh session.
 
 ### 🔴 High priority — bugs & security
 
@@ -49,10 +52,11 @@ see "Robustness & durability pass" below). Everything else is open.
    task run survives an API server restart and can scale across worker
    replicas — verified end-to-end (API → Redis → separate worker process →
    real OpenAI call → failure persisted to `status.json`). Off by default;
-   the in-process path is unchanged when `REDIS_URL` is unset. _Residual gap:
-   the plan-approval checkpoint (`MemorySaver` in `lib/agent/graph.ts`) is
-   still in-memory, so a paused task must be approved against the same
-   process that paused it — a persistent checkpointer would remove that._
+   the in-process path is unchanged when `REDIS_URL` is unset. The
+   plan-approval LangGraph checkpoint is now also persistent — a SQLite file
+   (`lib/agent/checkpointer.ts`) on the same shared volume as task artifacts
+   — so a paused task can be approved after a restart or by a different
+   worker process than the one that paused it. **✅ Done.**
 7. **Brittle tool-call parsing** — replaced the free-form JSON parsing with
    native `llm.bindTools(...)`: tools are LangChain structured tools with zod
    schemas, the model emits validated `tool_calls`, and `taskId` is injected
@@ -84,8 +88,9 @@ see "Robustness & durability pass" below). Everything else is open.
 16. **`execute_python` was a permanent stub** — now an env-gated opt-in: with
     `E2B_API_KEY` set it runs code in an isolated E2B cloud sandbox; without it,
     it falls back to the safe stub. **✅ Done** (live path requires an E2B key
-    to exercise; the fallback is unit-tested). _Daytona remains an alternative
-    if self-hosting is preferred._
+    to exercise; the fallback is unit-tested). _Daytona was evaluated as a
+    self-hosted alternative and deliberately not added — see the Batch D pass
+    below for why._
 17. **Missing `LICENSE`** — added MIT `LICENSE`; README now documents the
     `SERPER_API_KEY` fallback and a full scripts table. **✅ Done**.
 18. **Unbounded plan crashed the graph** — default `recursionLimit` (25) threw
@@ -97,8 +102,10 @@ see "Robustness & durability pass" below). Everything else is open.
 20. **Dead code in `memory.ts`** — `getAllFiles()` now backs the aggregated
     state endpoint; the unused `readPlan()` was removed. **✅ Done.**
 21. **Chatty polling (N+1)** — replaced 4–5 requests/tick with a single
-    `GET /api/agent/[taskId]` returning status + all docs. **✅ Done**
-    (streaming still a future option).
+    `GET /api/agent/[taskId]` returning status + all docs, then superseded by
+    a Server-Sent Events stream (`GET /api/agent/[taskId]/stream`) that pushes
+    updates the moment the task's on-disk state changes, instead of polling
+    on any fixed interval. **✅ Done**.
 22. **Drop the `uuid` dependency** — replaced with Node's `crypto.randomUUID()`;
     removed `uuid` + `@types/uuid`. **✅ Done**.
 23. **No `engines` field** — added `"node": ">=20"`. **✅ Done**.
@@ -167,6 +174,45 @@ differentiators:
   integration test and a full mocked-LLM graph run (both pause/resume and
   straight-through paths).
 
+### Batch D pass (this pass)
+- **Persistent LangGraph checkpointer:** swapped `MemorySaver` for
+  `SqliteSaver` (`@langchain/langgraph-checkpoint-sqlite`) backed by a file
+  on the same `/tmp/tasks_data` root as task artifacts
+  (`lib/agent/checkpointer.ts`, `CHECKPOINT_DB_PATH`). Closes the last
+  durability gap from #6: a task paused at plan-approval now survives a
+  process restart and can be resumed by a different process than the one
+  that paused it (both `web` and `worker` already share that volume). Proven
+  with a test that pauses under one dynamically-imported `agentApp`
+  instance, fully drops the module cache (`vi.resetModules()` — including the
+  module-level checkpointer singleton), re-imports fresh, and resumes to
+  completion from the second instance — about as close as a same-process
+  test can get to "a different process resumes it."
+- **Streaming step view:** `GET /api/agent/[taskId]/stream` (SSE) replaces
+  client-side polling. The server polls the task's on-disk files every 500ms
+  and only pushes a message when the serialized snapshot actually changed,
+  closing the connection itself once the task reaches a terminal status.
+  Verified live: a manually-simulated task produced exactly one SSE message
+  per real state change (initial state, plan write, completion) with no
+  extra/spurious messages. The client falls back to a one-shot poll of the
+  existing `GET /api/agent/[taskId]` on any SSE connection error.
+- **Findings fed into later steps:** the reinterpreted, cost-bounded version
+  of "feed completed-step state back into planning" — rather than adding a
+  new re-planning LLM call (which would break the provable call-count bound),
+  each execution step's prompt now includes a bounded summary of prior
+  steps' findings (`lib/agent/context.ts`, capped at 4000 chars, keeping the
+  most recent). No new LLM calls; later steps just stop working blind.
+  Verified with a mocked two-step run asserting step 2's prompt contains
+  step 1's finding and step 1's prompt doesn't (nothing to include yet).
+- **Daytona evaluated, not added:** both `@daytonaio/sdk` and its renamed
+  successor `@daytona/sdk` pull in a full OpenTelemetry exporter stack
+  whose `protobufjs` transitive dependency has several high-severity
+  advisories with no fix available — installing it took this repo from 0 to
+  27 `npm audit` findings. A hand-rolled REST client would sidestep that, but
+  there's no Daytona credential available in this environment to verify one
+  against the real API, and shipping an unverified integration isn't worth
+  the risk of it silently being broken. E2B remains the supported sandbox.
+- Test suite grew from 46 to 75 tests.
+
 ---
 
 ## 2. Competitive landscape & guardrails (2026)
@@ -180,21 +226,26 @@ them is both bug-fixing and differentiation.
 |---|---|
 | Runaway loops & "$80 overnight" API bills (AutoGPT/BabyAGI) | Hard `MAX_PLAN_STEPS`, `MAX_STEP_ATTEMPTS`, computed `RECURSION_LIMIT` → provable upper bound on LLM calls **✅** |
 | Subjective NL "is it done?" defaulting to "more work" | Objective leading-token verdict + bounded retry-then-skip **✅** |
-| Plans reinvented in circles from weak memory (BabyAGI) | Durable markdown memory; _open: feed completed-step state back into planning_ |
+| Plans reinvented in circles from weak memory (BabyAGI) | Durable markdown memory **✅**; prior steps' findings fed into each later step's prompt **✅** (`lib/agent/context.ts`) — the cost-bounded version of "feed state back into planning" (no new LLM calls) |
 | Opaque, unpredictable credit burn (top Manus complaint) | Live token/cost meter + worst-case pre-run estimate **✅** (`lib/agent/cost.ts`) |
-| Tasks fail mid-stream, no recovery, buckles under load (Manus) | UI error surfacing **✅**; optional durable queue/worker for resumable runs **✅** (`REDIS_URL`); _open: persistent checkpointer for multi-instance plan-approval resume_ |
+| Tasks fail mid-stream, no recovery, buckles under load (Manus) | UI error surfacing **✅**; optional durable queue/worker for resumable runs **✅** (`REDIS_URL`); persistent checkpointer for cross-process plan-approval resume **✅** (`lib/agent/checkpointer.ts`) |
 | Benchmark↔reality gap on long multi-file tasks (OpenHands) | Capped, well-scoped plans **✅**; honest scoping |
 | No human checkpoints — where everyone derails | Opt-in LangGraph `interruptBefore` plan-approval checkpoint **✅** (`REQUIRE_PLAN_APPROVAL`) |
-| Insecure / disabled code execution (our stub) | E2B sandbox opt-in **✅**; _open: Daytona as a self-hosted alternative_ |
+| Insecure / disabled code execution (our stub) | E2B sandbox opt-in **✅**; Daytona evaluated and deliberately not added (see Batch D pass — vulnerable transitive deps, unverifiable without credentials) |
 
 ### Features to elevate (adopt from leaders)
-- **Streaming, transparent step view** + a **shareable replay** of a run
-  (Manus's most-loved feature) — still open; current UI polls every 2s and
-  shows a live progress log, which covers "transparent" but not true
-  streaming or replay.
+- **Streaming, transparent step view** — **✅ Done**: `GET /api/agent/[taskId]/stream`
+  (SSE) pushes updates as the task's on-disk state changes. _Still open: a
+  **shareable replay** of a completed run_ (Manus's most-loved feature) —
+  the durable artifacts (`task_plan.md`, `findings.md`, `progress.md`,
+  `summary.md`) already contain everything a replay view would need; this is
+  now purely a UI/routing feature (e.g. a public read-only `/tasks/[taskId]`
+  page), not a data-model gap.
 - **Real final deliverable** — done; extend into a downloadable "insight brief".
 - **Integrations & persistent workspace** — explicit Manus gaps; the obvious
-  wedge for a self-hosted, BYO-key clone. Still open.
+  wedge for a self-hosted, BYO-key clone. Still open — genuinely open-ended
+  (which integrations, what "persistent workspace" means beyond the existing
+  per-task file workspace) and needs product direction, not just engineering.
 - **Multi-model / BYO-key** — **✅ Done** (`lib/agent/llm.ts`: OpenAI or
   Anthropic based on which key is set).
 
@@ -205,9 +256,15 @@ them is both bug-fixing and differentiation.
 - **Batch B (robustness):** done — #7 (native tool-calling), #10 (rate
   limiting), #11 (tests), #13 (CI), human-in-the-loop checkpoints.
 - **Batch C (architecture):** done — #6 durability (queue/worker), real
-  sandbox for `execute_python`. _Open: streaming UI._
-- **Batch D (next up):** persistent LangGraph checkpointer (removes the last
-  in-memory constraint on plan-approval resume across instances); streaming
-  step view + shareable run replay; feed completed-step state back into
-  planning; Daytona as a self-hosted `execute_python` alternative;
-  integrations / persistent workspace.
+  sandbox for `execute_python`.
+- **Batch D:** done — persistent LangGraph checkpointer, streaming step
+  view, findings fed into later steps' prompts. Daytona evaluated and
+  deliberately not added (dependency-vulnerability tradeoff).
+- **Batch E (next up, needs product direction more than engineering):**
+  shareable/replayable run view (public read-only page over the existing
+  durable artifacts); integrations & persistent workspace (undefined scope —
+  needs a decision on which integrations and what "persistent" means beyond
+  per-task files); a self-hosted sandbox alternative to E2B, if one can be
+  wired without the dependency-vulnerability tradeoff Daytona's current SDK
+  brings (e.g. a minimal hand-rolled REST client, verified against a real
+  account).
