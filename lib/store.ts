@@ -1,7 +1,15 @@
-// Simple in‑memory store for task status (Vercel serverless friendly)
-// In production, you'd use Upstash Redis or Vercel KV.
+// Fast in-memory cache of task status, layered over the durable status.json
+// written by MemoryFileManager. The on-disk record is the source of truth and
+// survives process restarts (e.g. across a Docker-volume-backed deployment);
+// this map just avoids a disk read on the hot path within a single instance.
 
-type TaskStatus = "pending" | "running" | "completed" | "failed";
+export type TaskStatus =
+  | "pending"
+  | "running"
+  | "awaiting_approval"
+  | "completed"
+  | "failed"
+  | "cancelled";
 
 interface TaskRecord {
   status: TaskStatus;
@@ -9,8 +17,6 @@ interface TaskRecord {
   updatedAt: Date;
 }
 
-// This will persist across invocations in the same function instance,
-// but not across cold starts. For demo, it's fine.
 const store = new Map<string, TaskRecord>();
 
 export const taskStore = {

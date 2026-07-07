@@ -22,3 +22,13 @@ COPY --from=builder /app/.next/static ./.next/static
 
 EXPOSE 3000
 CMD ["node", "server.js"]
+
+# Standalone worker for the optional Redis-backed durable queue (REDIS_URL).
+# Needs the full source + node_modules (unlike the slim `runner` above) since
+# it runs worker.ts directly via tsx rather than a Next.js build output.
+FROM node:20-alpine AS worker
+WORKDIR /app
+ENV NODE_ENV=production
+COPY --from=deps /app/node_modules ./node_modules
+COPY . .
+CMD ["npx", "tsx", "worker.ts"]

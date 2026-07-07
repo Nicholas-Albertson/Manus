@@ -1,144 +1,74 @@
-import { StateGraph, END, START } from "@langchain/langgraph";
-import { ChatOpenAI } from "@langchain/openai";
+import { StateGraph, END, START, MemorySaver } from "@langchain/langgraph";
 import { HumanMessage, SystemMessage } from "@langchain/core/messages";
-import { AgentState } from "./state";
+import { AgentAnnotation, type AgentState } from "./state";
 import { MemoryFileManager } from "./memory";
-import { tools } from "./tools";
+import { buildTools, TOOL_NAMES } from "./tools";
 import { taskStore } from "../store";
+import { asText } from "./text";
+import type { ToolCall } from "./state";
+import { getLlm, activeModelName } from "./llm";
+import { MAX_PLAN_STEPS, MAX_STEP_ATTEMPTS, RECURSION_LIMIT } from "./limits";
+import { env } from "../env";
 
-// --- Guardrails ------------------------------------------------------------
-// These bound total work (and therefore token spend) deterministically, which
-// is the single most common failure mode of autonomous agents: unbounded
-// loops and runaway API bills. The maximum number of LLM calls for a run is
-// 1 (plan) + MAX_PLAN_STEPS * MAX_STEP_ATTEMPTS * 2 (exec+verify) + 1 (summary).
-export const MAX_PLAN_STEPS = 12;
-export const MAX_STEP_ATTEMPTS = 2; // 1 initial try + up to 1 retry per step
-// LangGraph counts supersteps; set generously above the worst-case path so a
-// legitimate long run never trips it, while a runaway cycle still terminates.
-export const RECURSION_LIMIT =
-  2 + MAX_PLAN_STEPS * MAX_STEP_ATTEMPTS * 2 + 4;
-
-function getLlm() {
-  return new ChatOpenAI({
-    model: process.env.OPENAI_MODEL || "gpt-4o",
-    temperature: 0,
-  });
-}
-
-/** Safely coerce a LangChain message content (string | parts[]) to text. */
-export function asText(content: unknown): string {
-  if (typeof content === "string") return content;
-  if (Array.isArray(content)) {
-    return content
-      .map((part) => {
-        if (typeof part === "string") return part;
-        if (part && typeof part === "object" && "text" in part) {
-          return String((part as { text: unknown }).text ?? "");
-        }
-        return "";
-      })
-      .join("");
-  }
-  return content == null ? "" : String(content);
-}
-
-// --- Pure parsing/decision helpers ----------------------------------------
-// Extracted from the graph nodes so the brittle, bug-prone bits (LLM output
-// parsing, verdict interpretation, bounded-retry bookkeeping) can be unit
-// tested deterministically without invoking an LLM.
+export { MAX_PLAN_STEPS, MAX_STEP_ATTEMPTS, RECURSION_LIMIT };
 
 /**
- * Parse the planner's free-text response into a bounded list of steps.
- * Keeps only dash-prefixed lines, strips the marker, drops blanks, and caps
- * the count at `max` so a runaway plan can never exceed the guardrail.
+ * Checkpoints graph state so an interrupted run (plan-approval pause) can be
+ * resumed later with `agentApp.invoke(null, { configurable: { thread_id } })`.
+ * In-memory only — single-instance, same caveat as taskStore/rate limiting:
+ * a paused task can't be resumed after a process restart, and (with the
+ * optional Redis worker) must be resumed by the same worker process that
+ * paused it. A persistent checkpointer (e.g. Postgres/SQLite) would remove
+ * that constraint if multi-instance human-in-the-loop is needed.
  */
-export function parsePlan(content: string, max: number = MAX_PLAN_STEPS): string[] {
-  return content
-    .split("\n")
-    .filter((line) => line.trim().startsWith("-"))
-    .map((line) => line.replace(/^-\s*/, "").trim())
-    .filter((line) => line.length > 0)
-    .slice(0, max);
-}
+export const checkpointer = new MemorySaver();
 
-export type ParsedToolCall =
-  | { kind: "tool"; tool: string; arguments: Record<string, unknown> }
-  | { kind: "text" };
-
-/**
- * Interpret an execution-agent response as either a tool call or plain text.
- * Tolerates a fenced ```json block, returns `text` for malformed JSON, a
- * missing `tool` field, or an unknown tool name.
- */
-export function parseToolCall(
-  content: string,
-  toolRegistry: Record<string, unknown> = tools
-): ParsedToolCall {
-  try {
-    const json = content.replace(/^```(?:json)?\s*|\s*```$/g, "").trim();
-    const data = JSON.parse(json);
-    if (data && data.tool && toolRegistry[data.tool]) {
-      const args =
-        data.arguments && typeof data.arguments === "object" ? data.arguments : {};
-      return { kind: "tool", tool: data.tool, arguments: args };
-    }
-    return { kind: "text" };
-  } catch {
-    return { kind: "text" };
-  }
-}
-
-/** A verdict is a success only if its leading token is SUCCESS. */
-export function parseVerdict(content: string): boolean {
-  return content.trim().toUpperCase().startsWith("SUCCESS");
-}
-
-export type VerificationOutcome = "advance" | "retry" | "skip";
-
-export interface VerificationDecision {
-  outcome: VerificationOutcome;
-  currentStepIndex: number;
-  stepAttempts: number;
-}
-
-/**
- * Bounded retry-then-skip policy. On success, advance and reset attempts. On
- * failure, retry the same step until `MAX_STEP_ATTEMPTS` is reached, then skip
- * it so a single hard step can never stall the whole run.
- */
-export function decideVerification(
-  success: boolean,
-  currentStepIndex: number,
-  stepAttempts: number
-): VerificationDecision {
-  if (success) {
-    return { outcome: "advance", currentStepIndex: currentStepIndex + 1, stepAttempts: 0 };
-  }
-  const attempts = stepAttempts + 1;
-  if (attempts < MAX_STEP_ATTEMPTS) {
-    return { outcome: "retry", currentStepIndex, stepAttempts: attempts };
-  }
-  return { outcome: "skip", currentStepIndex: currentStepIndex + 1, stepAttempts: 0 };
+/** Record token usage from an LLM response, if the provider reported any. */
+async function trackUsage(memory: MemoryFileManager, response: { usage_metadata?: unknown }) {
+  const usage = response.usage_metadata as
+    | { input_tokens: number; output_tokens: number; total_tokens: number }
+    | undefined;
+  if (!usage) return;
+  await memory.recordUsage(activeModelName(), usage);
 }
 
 async function planningNode(state: AgentState): Promise<Partial<AgentState>> {
   const memory = new MemoryFileManager(state.taskId);
   await memory.init();
   taskStore.set(state.taskId, "running");
+  await memory.writeStatus("running");
 
   const llm = getLlm();
   const system = new SystemMessage(
     "You are an AI planning agent. Given a user's request, break it down into a numbered list of actionable steps. " +
-    "Each step should be clear and executable by an agent with tools: web_search, execute_python, read_file, write_file. " +
+    `Each step should be clear and executable by an agent with tools: ${[...TOOL_NAMES].join(", ")}. ` +
     `Use at most ${MAX_PLAN_STEPS} steps; prefer fewer, well-scoped steps over many ambiguous ones. ` +
     "Return ONLY the list, one step per line, starting with a dash and space."
   );
   const response = await llm.invoke([system, new HumanMessage(state.userInput)]);
+  await trackUsage(memory, response);
   const content = asText(response.content);
-  const lines = parsePlan(content, MAX_PLAN_STEPS);
+  const lines = content
+    .split("\n")
+    .filter(line => line.trim().startsWith("-"))
+    .map(line => line.replace(/^-\s*/, "").trim())
+    .filter(line => line.length > 0)
+    .slice(0, MAX_PLAN_STEPS);
 
   await memory.writePlan(lines);
   await memory.logProgress("Planning completed", `${lines.length} steps generated`);
+
+  // When plan approval is required, the graph interrupts right before the
+  // "planApproval" node — reflect that in status now, before the pause.
+  const needsApproval = env.requirePlanApproval() && lines.length > 0;
+  if (needsApproval) {
+    taskStore.set(state.taskId, "awaiting_approval");
+    await memory.writeStatus("awaiting_approval");
+    await memory.logProgress(
+      "Awaiting approval",
+      "Plan generated — waiting for approve/reject before execution begins"
+    );
+  }
 
   return {
     plan: lines,
@@ -146,6 +76,11 @@ async function planningNode(state: AgentState): Promise<Partial<AgentState>> {
     stepAttempts: 0,
     messages: [response],
   };
+}
+
+/** No-op node whose only purpose is an `interruptBefore` target for plan approval. */
+async function planApprovalNode(): Promise<Partial<AgentState>> {
+  return {};
 }
 
 async function executionNode(state: AgentState): Promise<Partial<AgentState>> {
@@ -158,60 +93,66 @@ async function executionNode(state: AgentState): Promise<Partial<AgentState>> {
     step
   );
 
-  const llm = getLlm();
+  // Native tool-calling: bind structured tools so the model emits validated
+  // tool_calls instead of free-form JSON we have to parse and hope is correct.
+  const taskTools = buildTools(state.taskId);
+  const toolByName = new Map(taskTools.map((t) => [t.name, t]));
+  const llm = getLlm().bindTools(taskTools);
+
   const system = new SystemMessage(
-    `You are an execution agent. You have access to these tools: ${Object.keys(tools).join(", ")}.\n` +
-      `To use a tool, respond with a JSON object: {"tool": "tool_name", "arguments": {...}}.\n` +
-      `Tool argument shapes:\n` +
-      `- web_search: {"query": string}\n` +
-      `- execute_python: {"code": string}\n` +
-      `- read_file: {"filePath": string}  (path relative to the task workspace)\n` +
-      `- write_file: {"filePath": string, "content": string}  (path relative to the task workspace)\n` +
-      `If no tool is needed, respond with plain text.\n` +
+    "You are an execution agent. Complete the current step. " +
+      "Call a tool when it helps; otherwise reply with the result as plain text. " +
       `Current step: ${step}`
   );
   const response = await llm.invoke([system, new HumanMessage(step)]);
-  const content = asText(response.content);
+  await trackUsage(memory, response);
 
-  let toolCall;
-  let resultText = "";
-  const parsed = parseToolCall(content, tools);
-  if (parsed.kind === "tool") {
-    try {
-      const args = { taskId: state.taskId, ...parsed.arguments };
-      const result = await tools[parsed.tool](args);
-      resultText = typeof result === "string" ? result : JSON.stringify(result);
-      toolCall = {
-        toolName: parsed.tool,
-        arguments: args,
-        result,
-        timestamp: new Date(),
-      };
-      await memory.appendFinding(`Tool ${parsed.tool} result: ${resultText}`);
-    } catch {
-      toolCall = {
-        toolName: "llm_response",
-        arguments: { response: content },
-        result: content,
-        timestamp: new Date(),
-      };
-      resultText = content;
-      await memory.appendFinding(`Step ${state.currentStepIndex + 1}: ${content}`);
+  const calls = response.tool_calls ?? [];
+  const recordedCalls: ToolCall[] = [];
+  const results: string[] = [];
+
+  for (const call of calls) {
+    const selected = toolByName.get(call.name);
+    let result: string;
+    if (selected) {
+      try {
+        result = String(await selected.invoke(call.args));
+      } catch (err) {
+        result = `Error running ${call.name}: ${
+          err instanceof Error ? err.message : String(err)
+        }`;
+      }
+    } else {
+      result = `Unknown tool requested: ${call.name}`;
     }
-  } else {
-    toolCall = {
-      toolName: "llm_response",
-      arguments: { response: content },
-      result: content,
+    recordedCalls.push({
+      toolName: call.name,
+      arguments: call.args,
+      result,
       timestamp: new Date(),
-    };
-    resultText = content;
-    await memory.appendFinding(`Step ${state.currentStepIndex + 1}: ${content}`);
+    });
+    results.push(result);
+    await memory.appendFinding(`Tool ${call.name} result: ${result}`);
+  }
+
+  let resultText: string;
+  if (calls.length > 0) {
+    resultText = results.join("\n");
+  } else {
+    // No tool call — the model answered directly.
+    resultText = asText(response.content);
+    recordedCalls.push({
+      toolName: "llm_response",
+      arguments: { response: resultText },
+      result: resultText,
+      timestamp: new Date(),
+    });
+    await memory.appendFinding(`Step ${state.currentStepIndex + 1}: ${resultText}`);
   }
 
   return {
     findings: [...state.findings, resultText],
-    toolCalls: [...state.toolCalls, toolCall],
+    toolCalls: [...state.toolCalls, ...recordedCalls],
     messages: [response],
   };
 }
@@ -230,33 +171,44 @@ async function verificationNode(state: AgentState): Promise<Partial<AgentState>>
     system,
     new HumanMessage(`Step: ${step}\nResult: ${lastResult}`),
   ]);
+  await trackUsage(memory, response);
   const verdict = asText(response.content);
   // Objective parse: look at the leading token, not a substring match anywhere.
-  const success = parseVerdict(verdict);
-  const decision = decideVerification(
-    success,
-    state.currentStepIndex,
-    state.stepAttempts
-  );
+  const leading = verdict.trim().toUpperCase();
+  const success = leading.startsWith("SUCCESS");
 
-  if (decision.outcome === "advance") {
+  if (success) {
     await memory.checkOffStep(state.currentStepIndex);
     await memory.logProgress(`Step ${state.currentStepIndex + 1} verified`, "SUCCESS");
-  } else if (decision.outcome === "retry") {
-    await memory.logProgress(
-      `Step ${state.currentStepIndex + 1} verification`,
-      `FAILURE (will retry, attempt ${decision.stepAttempts}/${MAX_STEP_ATTEMPTS}): ${verdict}`
-    );
-  } else {
-    await memory.logProgress(
-      `Step ${state.currentStepIndex + 1} verification`,
-      `FAILURE (max attempts reached, skipping): ${verdict}`
-    );
+    return {
+      currentStepIndex: state.currentStepIndex + 1,
+      stepAttempts: 0,
+      messages: [response],
+    };
   }
 
+  // Failure: retry the same step up to MAX_STEP_ATTEMPTS, then skip and move on
+  // so a single hard step can never stall the whole run.
+  const attempts = state.stepAttempts + 1;
+  if (attempts < MAX_STEP_ATTEMPTS) {
+    await memory.logProgress(
+      `Step ${state.currentStepIndex + 1} verification`,
+      `FAILURE (will retry, attempt ${attempts}/${MAX_STEP_ATTEMPTS}): ${verdict}`
+    );
+    return {
+      currentStepIndex: state.currentStepIndex,
+      stepAttempts: attempts,
+      messages: [response],
+    };
+  }
+
+  await memory.logProgress(
+    `Step ${state.currentStepIndex + 1} verification`,
+    `FAILURE (max attempts reached, skipping): ${verdict}`
+  );
   return {
-    currentStepIndex: decision.currentStepIndex,
-    stepAttempts: decision.stepAttempts,
+    currentStepIndex: state.currentStepIndex + 1,
+    stepAttempts: 0,
     messages: [response],
   };
 }
@@ -283,47 +235,47 @@ async function summaryNode(state: AgentState): Promise<Partial<AgentState>> {
       `Original request:\n${state.userInput}\n\nFindings:\n${state.findings.join("\n\n")}`
     );
     const response = await llm.invoke([system, human]);
+    await trackUsage(memory, response);
     finalOutput = asText(response.content);
   }
 
   await memory.writeSummary(finalOutput);
   await memory.logProgress("Task completed", "Summary generated");
   taskStore.set(state.taskId, "completed");
+  await memory.writeStatus("completed");
 
   return { finalOutput };
 }
 
-export function routeAfterStep(state: AgentState): "execution" | "summary" {
+function routeAfterStep(state: AgentState): "execution" | "summary" {
   if (state.currentStepIndex < state.plan.length) {
     return "execution";
   }
   return "summary";
 }
 
-const workflow = new StateGraph<AgentState>({
-  channels: {
-    taskId: { value: (a, b) => b ?? a },
-    userInput: { value: (a, b) => b ?? a },
-    plan: { value: (a, b) => b ?? a },
-    currentStepIndex: { value: (a, b) => b ?? a },
-    stepAttempts: { value: (a, b) => b ?? a },
-    findings: { value: (a, b) => a.concat(b) },
-    toolCalls: { value: (a, b) => a.concat(b) },
-    finalOutput: { value: (a, b) => b ?? a },
-    error: { value: (a, b) => b ?? a },
-    messages: { value: (a, b) => a.concat(b) },
-  },
-})
+// Empty plans always skip straight to summary. A non-empty plan goes through
+// the one-time "planApproval" checkpoint only when REQUIRE_PLAN_APPROVAL is
+// on; otherwise it proceeds straight to execution, preserving the default
+// run-to-completion experience.
+function routeAfterPlanning(state: AgentState): "planApproval" | "execution" | "summary" {
+  if (state.plan.length === 0) return "summary";
+  return env.requirePlanApproval() ? "planApproval" : "execution";
+}
+
+const workflow = new StateGraph(AgentAnnotation)
   .addNode("planning", planningNode)
+  .addNode("planApproval", planApprovalNode)
   .addNode("execution", executionNode)
   .addNode("verification", verificationNode)
   .addNode("summary", summaryNode)
   .addEdge(START, "planning")
-  // Empty plans route straight to summary instead of dead-ending in "running".
-  .addConditionalEdges("planning", routeAfterStep, {
+  .addConditionalEdges("planning", routeAfterPlanning, {
+    planApproval: "planApproval",
     execution: "execution",
     summary: "summary",
   })
+  .addEdge("planApproval", "execution")
   .addEdge("execution", "verification")
   .addConditionalEdges("verification", routeAfterStep, {
     execution: "execution",
@@ -331,4 +283,11 @@ const workflow = new StateGraph<AgentState>({
   })
   .addEdge("summary", END);
 
-export const agentApp = workflow.compile();
+// `interruptBefore: ["planApproval"]` only takes effect on runs that reach
+// that node (see routeAfterPlanning above) — the checkpointer is required by
+// LangGraph for any interrupt to work, so it's always attached; runs that
+// never pause simply never touch it.
+export const agentApp = workflow.compile({
+  checkpointer,
+  interruptBefore: ["planApproval"],
+});

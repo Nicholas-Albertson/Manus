@@ -6,11 +6,54 @@ services:
     environment:
       OPENAI_API_KEY: ${OPENAI_API_KEY}
       OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-}
+      LLM_PROVIDER: ${LLM_PROVIDER:-}
       SERPER_API_KEY: ${SERPER_API_KEY}
+      RATE_LIMIT_MAX: ${RATE_LIMIT_MAX:-}
+      RATE_LIMIT_WINDOW_MS: ${RATE_LIMIT_WINDOW_MS:-}
+      REQUIRE_PLAN_APPROVAL: ${REQUIRE_PLAN_APPROVAL:-}
+      # Leave unset for the default single-process mode (task runs execute
+      # in-process, fire-and-forget). Set to redis://redis:6379 *and* run
+      # with `--profile durable` to enable the durable queue/worker below.
+      REDIS_URL: ${REDIS_URL:-}
     volumes:
       - tasks_data:/tmp/tasks_data
     restart: unless-stopped
 
+  # Durable queue/worker mode — opt in with:
+  #   REDIS_URL=redis://redis:6379 docker compose --profile durable up --build
+  # Task runs then survive a `web` restart: the API enqueues jobs instead of
+  # invoking the agent graph in-process, and `worker` (a separate, scalable
+  # process) executes them. See lib/queue.ts and worker.ts.
+  redis:
+    image: redis:7-alpine
+    profiles: [durable]
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      target: worker
+    profiles: [durable]
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-}
+      LLM_PROVIDER: ${LLM_PROVIDER:-}
+      SERPER_API_KEY: ${SERPER_API_KEY}
+      E2B_API_KEY: ${E2B_API_KEY:-}
+      REQUIRE_PLAN_APPROVAL: ${REQUIRE_PLAN_APPROVAL:-}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379}
+    volumes:
+      - tasks_data:/tmp/tasks_data
+    depends_on:
+      - redis
+    restart: unless-stopped
+
 volumes:
   tasks_data:
-
+  redis_data:

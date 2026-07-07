@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { env } from "../../env";
 
 const webSearchArgsSchema = z.object({
   query: z.string().min(1),
@@ -23,7 +24,7 @@ export async function webSearch(args: unknown): Promise<string> {
 
   const query = parsedArgs.data.query;
   // Use Serper API if key is present, otherwise return simulated result
-  const SERPER_API_KEY = process.env.SERPER_API_KEY;
+  const SERPER_API_KEY = env.serperApiKey();
   if (SERPER_API_KEY) {
     try {
       const response = await fetch("https://google.serper.dev/search", {

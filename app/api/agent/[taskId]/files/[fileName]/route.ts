@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import fs from "fs/promises";
 import path from "path";
+import { isValidTaskId } from "../../../../../../lib/taskId";
 
 const allowedFiles = new Set([
   "task_plan.md",
@@ -9,16 +10,12 @@ const allowedFiles = new Set([
   "summary.md",
 ]);
 
-// task IDs are server-generated UUIDs; reject anything else to prevent path traversal.
-const taskIdPattern =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
 export async function GET(
   _req: NextRequest,
   { params }: { params: Promise<{ taskId: string; fileName: string }> }
 ) {
   const { taskId, fileName } = await params;
-  if (!taskId || !taskIdPattern.test(taskId)) {
+  if (!isValidTaskId(taskId)) {
     return NextResponse.json({ error: "Invalid taskId" }, { status: 400 });
   }
   if (!allowedFiles.has(fileName)) {

@@ -1,20 +1,37 @@
 import { NextRequest, NextResponse } from "next/server";
-import { v4 as uuidv4 } from "uuid";
-import { agentApp, RECURSION_LIMIT } from "../../../lib/agent/graph";
+import { randomUUID } from "crypto";
 import { AgentState } from "../../../lib/agent/state";
+import { MemoryFileManager } from "../../../lib/agent/memory";
+import { runTask } from "../../../lib/agent/run";
 import { taskStore } from "../../../lib/store";
+import { isValidTaskId } from "../../../lib/taskId";
+import { env } from "../../../lib/env";
+import { checkRateLimit, clientKeyFromHeaders } from "../../../lib/rateLimit";
 
 export const maxDuration = 60;
 
 export async function POST(req: NextRequest) {
   try {
-    if (!process.env.OPENAI_API_KEY) {
+    if (!env.hasAnyLlmKey()) {
       return NextResponse.json(
         {
           error:
-            "Missing OPENAI_API_KEY. Set it in your environment (e.g. .env.local) before starting a task.",
+            "Missing an LLM API key. Set OPENAI_API_KEY or ANTHROPIC_API_KEY in your environment (e.g. .env.local) before starting a task.",
         },
         { status: 500 }
+      );
+    }
+
+    const rateLimit = checkRateLimit(clientKeyFromHeaders(req.headers));
+    if (!rateLimit.allowed) {
+      const retryAfterSec = Math.ceil((rateLimit.retryAfterMs ?? 0) / 1000);
+      return NextResponse.json(
+        {
+          error: `Rate limit exceeded (${rateLimit.limit} tasks per ${Math.round(
+            env.rateLimitWindowMs() / 60000
+          )} min). Try again in ${retryAfterSec}s.`,
+        },
+        { status: 429, headers: { "Retry-After": String(retryAfterSec) } }
       );
     }
 
@@ -29,8 +46,13 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const taskId = uuidv4();
+    const taskId = randomUUID();
     taskStore.set(taskId, "pending");
+
+    // Persist an initial status so the task is observable before the graph runs.
+    const memory = new MemoryFileManager(taskId);
+    await memory.init();
+    await memory.writeStatus("pending");
 
     const initialState: AgentState = {
       taskId,
@@ -41,12 +63,11 @@ export async function POST(req: NextRequest) {
       findings: [],
       toolCalls: [],
       messages: [],
+      finalOutput: undefined,
+      error: undefined,
     };
 
-    agentApp.invoke(initialState, { recursionLimit: RECURSION_LIMIT }).catch((err) => {
-      console.error(`Agent error for task ${taskId}:`, err);
-      taskStore.set(taskId, "failed");
-    });
+    runTask(initialState);
 
     return NextResponse.json({ taskId, status: "started" });
   } catch (error) {
@@ -58,10 +79,11 @@ export async function POST(req: NextRequest) {
 export async function GET(req: NextRequest) {
   const { searchParams } = new URL(req.url);
   const taskId = searchParams.get("taskId");
-  if (!taskId) {
-    return NextResponse.json({ error: "Missing taskId" }, { status: 400 });
+  if (!isValidTaskId(taskId)) {
+    return NextResponse.json({ error: "Invalid taskId" }, { status: 400 });
   }
 
-  const status = taskStore.get(taskId) || "pending";
-  return NextResponse.json({ taskId, status });
+  const durable = await new MemoryFileManager(taskId).readStatus();
+  const status = durable?.status || taskStore.get(taskId) || "pending";
+  return NextResponse.json({ taskId, status, error: durable?.error ?? null });
 }
