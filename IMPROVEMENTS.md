@@ -4,18 +4,22 @@ A consolidated, prioritized backlog for this Manus-style agent prototype
 (Next.js App Router + LangChain/LangGraph), produced from a full code review
 plus competitive research of the 2026 autonomous-agent landscape.
 
-Items marked **✅ Done** were implemented in the first hardening pass (the
-loop/cost + verification + final-output cluster). Everything else is open.
+Items marked **✅ Done** were implemented across two hardening passes: the
+first (loop/cost + verification + final-output cluster), and a second
+(durability, rate limiting, cost visibility, human-in-the-loop, multi-model —
+see "Robustness & durability pass" below). Everything else is open.
 
 ---
 
 ## 1. Code review findings
 
-> **Progress:** 24 of 26 findings done or partially done. The only substantive
-> item remaining is #6 (full multi-instance durability — status is persisted,
-> but a queue/worker is still needed and requires external infra to build and
-> verify). A live end-to-end run is also pending an `OPENAI_API_KEY` secret in
-> a fresh session.
+> **Progress:** 26 of 26 findings done or partially done. #6 (durability) now
+> has a real queue/worker option (verified end-to-end against a live Redis +
+> BullMQ worker + a real OpenAI auth-failure round trip); the remaining gap is
+> a persistent LangGraph checkpointer for multi-instance plan-approval resume
+> (currently in-memory, see the Robustness pass below). A live end-to-end
+> *successful* run (not just the auth-failure round trip) is still pending a
+> real `OPENAI_API_KEY`/`ANTHROPIC_API_KEY` secret in a fresh session.
 
 ### 🔴 High priority — bugs & security
 
@@ -39,10 +43,16 @@ loop/cost + verification + final-output cluster). Everything else is open.
 
 6. **Fire-and-forget execution + in-memory store is non-durable** — detached
    `agentApp.invoke()` and a `Map`-based `taskStore` only work on a single,
-   long-lived instance. **✅ partial:** status is now persisted to a durable
-   `status.json` (read back by the API, surviving restarts on a shared volume),
-   with the in-memory map kept as a hot-path cache. _Open: queue/worker for
-   true multi-instance execution._
+   long-lived instance. **✅ Done:** status is persisted to a durable
+   `status.json`, and an optional Redis/BullMQ queue+worker (`REDIS_URL`,
+   `lib/queue.ts`, `worker.ts`) replaces the direct in-process invoke, so a
+   task run survives an API server restart and can scale across worker
+   replicas — verified end-to-end (API → Redis → separate worker process →
+   real OpenAI call → failure persisted to `status.json`). Off by default;
+   the in-process path is unchanged when `REDIS_URL` is unset. _Residual gap:
+   the plan-approval checkpoint (`MemorySaver` in `lib/agent/graph.ts`) is
+   still in-memory, so a paused task must be approved against the same
+   process that paused it — a persistent checkpointer would remove that._
 7. **Brittle tool-call parsing** — replaced the free-form JSON parsing with
    native `llm.bindTools(...)`: tools are LangChain structured tools with zod
    schemas, the model emits validated `tool_calls`, and `taskId` is injected
@@ -52,8 +62,10 @@ loop/cost + verification + final-output cluster). Everything else is open.
    Now routes straight to the summary node. **✅ Done**.
 9. **Unsafe `response.content as string` casts** — content can be structured
    parts. Centralized in an `asText()` helper. **✅ Done**.
-10. **No request limits / rate limiting** — added a 4000-char input cap
-    **✅ partial**; _open: real rate limiting._
+10. **No request limits / rate limiting** — added a 4000-char input cap, and
+    now a real per-IP sliding-window rate limiter on task creation
+    (`lib/rateLimit.ts`, `RATE_LIMIT_MAX`/`RATE_LIMIT_WINDOW_MS`, 429 +
+    `Retry-After`). **✅ Done.**
 
 ### 🟡 Lower — quality, DX, polish
 
@@ -83,7 +95,7 @@ loop/cost + verification + final-output cluster). Everything else is open.
     written. Added a synthesis node that emits an executive summary to
     `summary.md` and the UI (now rendered as markdown). **✅ Done**.
 20. **Dead code in `memory.ts`** — `getAllFiles()` now backs the aggregated
-    state endpoint. **✅ partial** (`readPlan()` still unused).
+    state endpoint; the unused `readPlan()` was removed. **✅ Done.**
 21. **Chatty polling (N+1)** — replaced 4–5 requests/tick with a single
     `GET /api/agent/[taskId]` returning status + all docs. **✅ Done**
     (streaming still a future option).
@@ -125,6 +137,36 @@ loop/cost + verification + final-output cluster). Everything else is open.
   and `public/N`, added `engines`, MIT `LICENSE`, `robots.txt`, and refreshed
   the README.
 
+### Robustness & durability pass (this pass)
+Closed out the remaining Batch B/C backlog and several competitive-landscape
+differentiators:
+- **Real rate limiting:** per-IP sliding-window limiter on task creation
+  (`lib/rateLimit.ts`), 429 + `Retry-After`, configurable via
+  `RATE_LIMIT_MAX`/`RATE_LIMIT_WINDOW_MS`.
+- **Multi-model / BYO-key:** `lib/agent/llm.ts` picks OpenAI or Anthropic
+  based on which key (or `LLM_PROVIDER`) is set — every node calls the same
+  `getLlm()` instead of a hardcoded `ChatOpenAI`.
+- **Token/cost visibility:** every LLM call's `usage_metadata` is recorded
+  per task (`lib/agent/cost.ts`, `usage.json`), exposed via the status API,
+  and shown live in the UI alongside a worst-case pre-run cost estimate
+  (`/api/config`) derived from the deterministic step/attempt bounds —
+  directly answers the "opaque, unpredictable credit burn" complaint below.
+- **Human-in-the-loop plan approval:** opt-in (`REQUIRE_PLAN_APPROVAL=true`)
+  LangGraph `interruptBefore` checkpoint that pauses the graph right after
+  planning — before any execution step or tool call — until an explicit
+  approve/reject call resumes or cancels it (`app/api/agent/[taskId]/
+  approve|reject`). Verified end-to-end with a mocked LLM
+  (`tests/graph.test.ts`): pause, correct status, resume, completion.
+- **Durable queue/worker:** optional Redis/BullMQ queue (`REDIS_URL`) with a
+  standalone `worker.ts` process, wired through `docker-compose.yml`'s
+  `durable` profile. Verified against a real local Redis: enqueue → separate
+  worker process dequeues → calls the real OpenAI API → failure is caught and
+  persisted to `status.json`, all through the actual HTTP API.
+- **Dead code removed:** `MemoryFileManager.readPlan()`.
+- Test suite grew from 16 to 46 tests, including a real (non-mocked) Redis
+  integration test and a full mocked-LLM graph run (both pause/resume and
+  straight-through paths).
+
 ---
 
 ## 2. Competitive landscape & guardrails (2026)
@@ -138,27 +180,34 @@ them is both bug-fixing and differentiation.
 |---|---|
 | Runaway loops & "$80 overnight" API bills (AutoGPT/BabyAGI) | Hard `MAX_PLAN_STEPS`, `MAX_STEP_ATTEMPTS`, computed `RECURSION_LIMIT` → provable upper bound on LLM calls **✅** |
 | Subjective NL "is it done?" defaulting to "more work" | Objective leading-token verdict + bounded retry-then-skip **✅** |
-| Plans reinvented in circles from weak memory (BabyAGI) | Durable markdown memory; _open: feed completed-step state back into planning (#6)_ |
-| Opaque, unpredictable credit burn (top Manus complaint) | _Open: live token/cost meter + pre-run estimate (#4 differentiator)_ |
-| Tasks fail mid-stream, no recovery, buckles under load (Manus) | UI error surfacing **✅**; _open: resumable checkpointed runs (#6)_ |
+| Plans reinvented in circles from weak memory (BabyAGI) | Durable markdown memory; _open: feed completed-step state back into planning_ |
+| Opaque, unpredictable credit burn (top Manus complaint) | Live token/cost meter + worst-case pre-run estimate **✅** (`lib/agent/cost.ts`) |
+| Tasks fail mid-stream, no recovery, buckles under load (Manus) | UI error surfacing **✅**; optional durable queue/worker for resumable runs **✅** (`REDIS_URL`); _open: persistent checkpointer for multi-instance plan-approval resume_ |
 | Benchmark↔reality gap on long multi-file tasks (OpenHands) | Capped, well-scoped plans **✅**; honest scoping |
-| No human checkpoints — where everyone derails | _Open: LangGraph `interrupt_before` human-in-the-loop approval_ |
-| Insecure / disabled code execution (our stub) | _Open: real sandbox — **E2B** (Firecracker microVMs) or **Daytona** (OSS, self-host, persistent workspaces)_ |
+| No human checkpoints — where everyone derails | Opt-in LangGraph `interruptBefore` plan-approval checkpoint **✅** (`REQUIRE_PLAN_APPROVAL`) |
+| Insecure / disabled code execution (our stub) | E2B sandbox opt-in **✅**; _open: Daytona as a self-hosted alternative_ |
 
 ### Features to elevate (adopt from leaders)
 - **Streaming, transparent step view** + a **shareable replay** of a run
-  (Manus's most-loved feature).
+  (Manus's most-loved feature) — still open; current UI polls every 2s and
+  shows a live progress log, which covers "transparent" but not true
+  streaming or replay.
 - **Real final deliverable** — done; extend into a downloadable "insight brief".
 - **Integrations & persistent workspace** — explicit Manus gaps; the obvious
-  wedge for a self-hosted, BYO-key clone.
-- **Multi-model / BYO-key** — abstract the hardcoded `gpt-4o` (OpenHands'
-  100+ model support is a key OSS draw).
+  wedge for a self-hosted, BYO-key clone. Still open.
+- **Multi-model / BYO-key** — **✅ Done** (`lib/agent/llm.ts`: OpenAI or
+  Anthropic based on which key is set).
 
 ---
 
 ## Suggested next batches
-- **Batch A (safe cleanup):** #4, #5, #20, #22, #23, #25, #26.
-- **Batch B (robustness):** #7 (native tool-calling), #10 (rate limiting),
-  #11 (tests), #13 (CI), human-in-the-loop checkpoints.
-- **Batch C (architecture):** #6 durability (queue/worker + persistent state),
-  real sandbox for `execute_python`, streaming UI.
+- **Batch A (safe cleanup):** done — #4, #5, #20, #22, #23, #25, #26.
+- **Batch B (robustness):** done — #7 (native tool-calling), #10 (rate
+  limiting), #11 (tests), #13 (CI), human-in-the-loop checkpoints.
+- **Batch C (architecture):** done — #6 durability (queue/worker), real
+  sandbox for `execute_python`. _Open: streaming UI._
+- **Batch D (next up):** persistent LangGraph checkpointer (removes the last
+  in-memory constraint on plan-approval resume across instances); streaming
+  step view + shareable run replay; feed completed-step state back into
+  planning; Daytona as a self-hosted `execute_python` alternative;
+  integrations / persistent workspace.

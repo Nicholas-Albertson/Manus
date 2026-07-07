@@ -15,9 +15,10 @@ export async function GET(
   }
 
   const memory = new MemoryFileManager(taskId);
-  const [files, durable] = await Promise.all([
+  const [files, durable, usage] = await Promise.all([
     memory.getAllFiles(),
     memory.readStatus(),
+    memory.readUsage(),
   ]);
   const status = durable?.status || taskStore.get(taskId) || "pending";
 
@@ -30,6 +31,7 @@ export async function GET(
       findings: files["findings.md"] || "",
       progress: files["progress.md"] || "",
       summary: files["summary.md"] || "",
+      usage,
     },
     { headers: { "Cache-Control": "no-store" } }
   );

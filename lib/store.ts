@@ -3,7 +3,13 @@
 // survives process restarts (e.g. across a Docker-volume-backed deployment);
 // this map just avoids a disk read on the hot path within a single instance.
 
-export type TaskStatus = "pending" | "running" | "completed" | "failed";
+export type TaskStatus =
+  | "pending"
+  | "running"
+  | "awaiting_approval"
+  | "completed"
+  | "failed"
+  | "cancelled";
 
 interface TaskRecord {
   status: TaskStatus;

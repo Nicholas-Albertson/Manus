@@ -32,3 +32,7 @@ yarn-error.log*
 
 # tasks data (local only)
 /tasks_data
+
+# local redis-server dump (e.g. running tests/queue.test.ts against a
+# locally-started redis-server instead of Docker/CI's redis service)
+dump.rdb
