@@ -16,7 +16,7 @@ export async function POST(req: NextRequest) {
       return NextResponse.json(
         {
           error:
-            "Missing an LLM API key. Set OPENAI_API_KEY or ANTHROPIC_API_KEY in your environment (e.g. .env.local) before starting a task.",
+            "Missing an LLM API key. Set OPENROUTER_API_KEY or ANTHROPIC_API_KEY in your environment (e.g. .env.local) before starting a task.",
         },
         { status: 500 }
       );

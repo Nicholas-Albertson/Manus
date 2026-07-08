@@ -7,13 +7,13 @@ them with tools, verifies each result, and delivers a consolidated answer.
 ## Requirements
 
 - Node.js 20+
-- An LLM API key: `OPENAI_API_KEY` or `ANTHROPIC_API_KEY`
+- An LLM API key: `OPENROUTER_API_KEY` or `ANTHROPIC_API_KEY`
 
 ## Local run
 
 ```bash
 cp .env.local.example .env.local
-# edit .env.local and set OPENAI_API_KEY (or ANTHROPIC_API_KEY)
+# edit .env.local and set OPENROUTER_API_KEY (or ANTHROPIC_API_KEY)
 
 npm ci
 npm run dev
@@ -28,8 +28,8 @@ the full list with defaults; the highlights:
 
 | Variable | Purpose |
 | --- | --- |
-| `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` | At least one is required. `LLM_PROVIDER=openai\|anthropic` forces a choice when both are set (OpenAI wins by default). |
-| `OPENAI_MODEL` / `ANTHROPIC_MODEL` | Override the default model per provider. |
+| `OPENROUTER_API_KEY` / `ANTHROPIC_API_KEY` | At least one is required. `OPENROUTER_API_KEY` authenticates against [OpenRouter](https://openrouter.ai)'s OpenAI-compatible API. `LLM_PROVIDER=openai\|anthropic` forces a choice when both are set (OpenAI/OpenRouter wins by default). |
+| `OPENAI_MODEL` / `ANTHROPIC_MODEL` | Override the default model per provider. `OPENAI_MODEL` uses OpenRouter's `vendor/model` slug format (e.g. `openai/gpt-4o`). |
 | `SERPER_API_KEY` | Enables real `web_search` results; without it, a simulated result is returned. |
 | `E2B_API_KEY` | Enables real sandboxed `execute_python` via [E2B](https://e2b.dev); without it, the tool returns a safe stub. |
 | `RATE_LIMIT_MAX` / `RATE_LIMIT_WINDOW_MS` | Per-IP task-creation rate limit. Defaults to 10 tasks / 10 minutes. |
@@ -58,9 +58,9 @@ tests exercise a real Redis instance rather than skipping.
 Create a `.env` file (used by `docker compose`) with at least:
 
 ```
-OPENAI_API_KEY=...
+OPENROUTER_API_KEY=...
 # optional:
-OPENAI_MODEL=gpt-4o
+OPENAI_MODEL=openai/gpt-4o
 SERPER_API_KEY=...
 ```
 
