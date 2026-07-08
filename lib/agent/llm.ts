@@ -4,7 +4,7 @@
 // file plus the pricing table in cost.ts.
 import { ChatOpenAI } from "@langchain/openai";
 import { ChatAnthropic } from "@langchain/anthropic";
-import { env, type LlmProvider } from "../env";
+import { env, OPENROUTER_BASE_URL, type LlmProvider } from "../env";
 
 // Union (not the base interface) so callers can rely on `bindTools` being
 // present — it's optional on the base `BaseChatModel` type but concretely
@@ -17,9 +17,13 @@ export function getLlm(): ChatOpenAI | ChatAnthropic {
       temperature: 0,
     });
   }
+  // Routed through OpenRouter's OpenAI-compatible API rather than OpenAI
+  // directly, so both the key and base URL must be set explicitly.
   return new ChatOpenAI({
     model: env.openAiModel(),
     temperature: 0,
+    apiKey: env.openRouterApiKey(),
+    configuration: { baseURL: OPENROUTER_BASE_URL },
   });
 }
 

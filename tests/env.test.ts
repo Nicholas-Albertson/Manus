@@ -21,8 +21,8 @@ describe("env", () => {
       "ANTHROPIC_MODEL",
       "E2B_API_KEY",
       "LLM_PROVIDER",
-      "OPENAI_API_KEY",
       "OPENAI_MODEL",
+      "OPENROUTER_API_KEY",
       "RATE_LIMIT_MAX",
       "RATE_LIMIT_WINDOW_MS",
       "REDIS_URL",
@@ -53,27 +53,27 @@ describe("env", () => {
 
   it("llmProvider() infers from whichever key is present, OpenAI wins if both set", () => {
     delete process.env.LLM_PROVIDER;
-    process.env.OPENAI_API_KEY = "sk-...";
+    process.env.OPENROUTER_API_KEY = "sk-...";
     delete process.env.ANTHROPIC_API_KEY;
     expect(env.llmProvider()).toBe("openai");
 
-    delete process.env.OPENAI_API_KEY;
+    delete process.env.OPENROUTER_API_KEY;
     process.env.ANTHROPIC_API_KEY = "sk-ant-...";
     expect(env.llmProvider()).toBe("anthropic");
 
-    process.env.OPENAI_API_KEY = "sk-...";
+    process.env.OPENROUTER_API_KEY = "sk-...";
     expect(env.llmProvider()).toBe("openai");
   });
 
   it("llmProvider() respects an explicit LLM_PROVIDER override", () => {
-    process.env.OPENAI_API_KEY = "sk-...";
+    process.env.OPENROUTER_API_KEY = "sk-...";
     process.env.ANTHROPIC_API_KEY = "sk-ant-...";
     process.env.LLM_PROVIDER = "anthropic";
     expect(env.llmProvider()).toBe("anthropic");
   });
 
   it("hasAnyLlmKey() reflects either provider key", () => {
-    delete process.env.OPENAI_API_KEY;
+    delete process.env.OPENROUTER_API_KEY;
     delete process.env.ANTHROPIC_API_KEY;
     expect(env.hasAnyLlmKey()).toBe(false);
     process.env.ANTHROPIC_API_KEY = "sk-ant-...";

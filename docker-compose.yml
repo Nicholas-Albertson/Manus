@@ -4,8 +4,8 @@ services:
     ports:
       - "3000:3000"
     environment:
-      OPENAI_API_KEY: ${OPENAI_API_KEY}
-      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
+      OPENAI_MODEL: ${OPENAI_MODEL:-openai/gpt-4o}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-}
       LLM_PROVIDER: ${LLM_PROVIDER:-}
@@ -39,8 +39,8 @@ services:
       target: worker
     profiles: [durable]
     environment:
-      OPENAI_API_KEY: ${OPENAI_API_KEY}
-      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
+      OPENAI_MODEL: ${OPENAI_MODEL:-openai/gpt-4o}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-}
       LLM_PROVIDER: ${LLM_PROVIDER:-}

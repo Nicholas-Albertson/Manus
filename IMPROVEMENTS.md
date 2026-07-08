@@ -22,7 +22,7 @@ checkpointer, streaming, findings-in-context). Everything else is open.
 > and against a freshly-reimported graph module standing in for a process
 > restart (`tests/graph.test.ts`). A live end-to-end *successful* run (not
 > just the auth-failure round trip) is still pending a real
-> `OPENAI_API_KEY`/`ANTHROPIC_API_KEY` secret in a fresh session.
+> `OPENROUTER_API_KEY`/`ANTHROPIC_API_KEY` secret in a fresh session.
 
 ### 🔴 High priority — bugs & security
 
