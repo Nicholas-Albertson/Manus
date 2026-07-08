@@ -72,7 +72,7 @@ export default function Home() {
   const [copied, setCopied] = useState(false);
   const [tab, setTab] = useState<"findings" | "progress">("findings");
   const [config, setConfig] = useState<RunConfig | null>(null);
-  const intervalRef = useRef<NodeJS.Timeout | null>(null);
+  const eventSourceRef = useRef<EventSource | null>(null);
 
   useEffect(() => {
     fetch("/api/config")
@@ -90,7 +90,7 @@ export default function Home() {
     setError("");
     setTaskId(null);
     setState({ status: "", plan: "", findings: "", progress: "", summary: "" });
-    if (intervalRef.current) clearInterval(intervalRef.current);
+    eventSourceRef.current?.close();
     try {
       const res = await fetch("/api/agent", {
         method: "POST",
@@ -115,32 +115,49 @@ export default function Home() {
   useEffect(() => {
     if (!taskId) return;
 
-    const poll = async () => {
+    const TERMINAL = new Set(["completed", "failed", "cancelled"]);
+    const applySnapshot = (data: TaskState) => {
+      setState({
+        status: data.status,
+        error: data.error,
+        plan: data.plan,
+        findings: data.findings,
+        progress: data.progress,
+        summary: data.summary,
+        usage: data.usage,
+      });
+      if (TERMINAL.has(data.status)) {
+        eventSourceRef.current?.close();
+      }
+    };
+
+    // Live push over SSE — the server only sends a message when the task's
+    // on-disk state actually changes, so this reflects each planning/exec/
+    // verify step as it happens rather than waiting out a poll interval.
+    const es = new EventSource(`/api/agent/${taskId}/stream`);
+    eventSourceRef.current = es;
+
+    es.onmessage = (ev) => {
       try {
-        const res = await fetch(`/api/agent/${taskId}`);
-        if (!res.ok) return;
-        const data: TaskState = await res.json();
-        setState({
-          status: data.status,
-          error: data.error,
-          plan: data.plan,
-          findings: data.findings,
-          progress: data.progress,
-          summary: data.summary,
-          usage: data.usage,
-        });
-        if (["completed", "failed", "cancelled"].includes(data.status)) {
-          if (intervalRef.current) clearInterval(intervalRef.current);
-        }
+        applySnapshot(JSON.parse(ev.data));
       } catch (err) {
         console.error(err);
       }
     };
 
-    poll();
-    intervalRef.current = setInterval(poll, 2000);
+    es.onerror = () => {
+      // The connection dropped before a terminal status arrived (the browser
+      // will keep retrying on its own); poll once immediately so the UI
+      // doesn't stall in the meantime.
+      fetch(`/api/agent/${taskId}`)
+        .then((res) => (res.ok ? res.json() : null))
+        .then((data) => data && applySnapshot(data))
+        .catch(() => {});
+    };
+
     return () => {
-      if (intervalRef.current) clearInterval(intervalRef.current);
+      es.close();
+      if (eventSourceRef.current === es) eventSourceRef.current = null;
     };
   }, [taskId]);
 

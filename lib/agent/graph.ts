@@ -1,4 +1,4 @@
-import { StateGraph, END, START, MemorySaver } from "@langchain/langgraph";
+import { StateGraph, END, START } from "@langchain/langgraph";
 import { HumanMessage, SystemMessage } from "@langchain/core/messages";
 import { AgentAnnotation, type AgentState } from "./state";
 import { MemoryFileManager } from "./memory";
@@ -9,19 +9,20 @@ import type { ToolCall } from "./state";
 import { getLlm, activeModelName } from "./llm";
 import { MAX_PLAN_STEPS, MAX_STEP_ATTEMPTS, RECURSION_LIMIT } from "./limits";
 import { env } from "../env";
+import { createCheckpointer } from "./checkpointer";
+import { buildFindingsContext } from "./context";
 
 export { MAX_PLAN_STEPS, MAX_STEP_ATTEMPTS, RECURSION_LIMIT };
 
 /**
  * Checkpoints graph state so an interrupted run (plan-approval pause) can be
  * resumed later with `agentApp.invoke(null, { configurable: { thread_id } })`.
- * In-memory only — single-instance, same caveat as taskStore/rate limiting:
- * a paused task can't be resumed after a process restart, and (with the
- * optional Redis worker) must be resumed by the same worker process that
- * paused it. A persistent checkpointer (e.g. Postgres/SQLite) would remove
- * that constraint if multi-instance human-in-the-loop is needed.
+ * Persisted to a SQLite file (see checkpointer.ts) rather than kept
+ * in-memory, so a paused task survives a process restart and can be resumed
+ * by any process sharing the file — including across the `web`/`worker`
+ * split in durable-queue mode.
  */
-export const checkpointer = new MemorySaver();
+export const checkpointer = createCheckpointer();
 
 /** Record token usage from an LLM response, if the provider reported any. */
 async function trackUsage(memory: MemoryFileManager, response: { usage_metadata?: unknown }) {
@@ -102,7 +103,8 @@ async function executionNode(state: AgentState): Promise<Partial<AgentState>> {
   const system = new SystemMessage(
     "You are an execution agent. Complete the current step. " +
       "Call a tool when it helps; otherwise reply with the result as plain text. " +
-      `Current step: ${step}`
+      `Current step: ${step}` +
+      buildFindingsContext(state.findings)
   );
   const response = await llm.invoke([system, new HumanMessage(step)]);
   await trackUsage(memory, response);

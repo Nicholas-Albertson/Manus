@@ -1,10 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
-import { MemoryFileManager } from "../../../../lib/agent/memory";
-import { taskStore } from "../../../../lib/store";
 import { isValidTaskId } from "../../../../lib/taskId";
+import { getTaskSnapshot } from "../../../../lib/agent/snapshot";
 
-// Single endpoint returning status + all task documents, so the client can poll
-// once per tick instead of issuing five separate requests.
+// Single endpoint returning status + all task documents. Prefer the SSE
+// stream at GET /api/agent/[taskId]/stream for live updates; this remains
+// for one-shot fetches (e.g. non-EventSource clients, initial load).
 export async function GET(
   _req: NextRequest,
   { params }: { params: Promise<{ taskId: string }> }
@@ -14,25 +14,6 @@ export async function GET(
     return NextResponse.json({ error: "Invalid taskId" }, { status: 400 });
   }
 
-  const memory = new MemoryFileManager(taskId);
-  const [files, durable, usage] = await Promise.all([
-    memory.getAllFiles(),
-    memory.readStatus(),
-    memory.readUsage(),
-  ]);
-  const status = durable?.status || taskStore.get(taskId) || "pending";
-
-  return NextResponse.json(
-    {
-      taskId,
-      status,
-      error: durable?.error ?? null,
-      plan: files["task_plan.md"] || "",
-      findings: files["findings.md"] || "",
-      progress: files["progress.md"] || "",
-      summary: files["summary.md"] || "",
-      usage,
-    },
-    { headers: { "Cache-Control": "no-store" } }
-  );
+  const snapshot = await getTaskSnapshot(taskId);
+  return NextResponse.json(snapshot, { headers: { "Cache-Control": "no-store" } });
 }
