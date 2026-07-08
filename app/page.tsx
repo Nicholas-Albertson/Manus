@@ -19,9 +19,19 @@ const STATUS_META: Record<
   pending: { label: "Pending", dot: "bg-yellow-400", chip: "bg-yellow-900/60 text-yellow-200", busy: true },
   started: { label: "Starting", dot: "bg-yellow-400", chip: "bg-yellow-900/60 text-yellow-200", busy: true },
   running: { label: "Running", dot: "bg-blue-400", chip: "bg-blue-900/60 text-blue-200", busy: true },
+  awaiting_approval: { label: "Awaiting approval", dot: "bg-purple-400", chip: "bg-purple-900/60 text-purple-200", busy: false },
   completed: { label: "Completed", dot: "bg-green-400", chip: "bg-green-900/60 text-green-200", busy: false },
   failed: { label: "Failed", dot: "bg-red-400", chip: "bg-red-900/60 text-red-200", busy: false },
+  cancelled: { label: "Cancelled", dot: "bg-gray-400", chip: "bg-gray-800 text-gray-300", busy: false },
 };
+
+interface UsageTotals {
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  costUsd: number;
+  calls: number;
+}
 
 interface TaskState {
   status: string;
@@ -30,6 +40,21 @@ interface TaskState {
   findings: string;
   progress: string;
   summary: string;
+  usage?: UsageTotals;
+}
+
+interface RunConfig {
+  provider: string;
+  model: string;
+  maxPlanSteps: number;
+  maxStepAttempts: number;
+  estimate: { minCalls: number; maxCalls: number; maxCostUsd: number };
+}
+
+function formatUsd(amount: number): string {
+  if (amount === 0) return "$0.00";
+  if (amount < 0.01) return "<$0.01";
+  return `$${amount.toFixed(2)}`;
 }
 
 export default function Home() {
@@ -46,7 +71,15 @@ export default function Home() {
   const [error, setError] = useState("");
   const [copied, setCopied] = useState(false);
   const [tab, setTab] = useState<"findings" | "progress">("findings");
-  const intervalRef = useRef<NodeJS.Timeout | null>(null);
+  const [config, setConfig] = useState<RunConfig | null>(null);
+  const eventSourceRef = useRef<EventSource | null>(null);
+
+  useEffect(() => {
+    fetch("/api/config")
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => data && setConfig(data))
+      .catch(() => {});
+  }, []);
 
   const meta = STATUS_META[state.status] ?? null;
 
@@ -57,7 +90,7 @@ export default function Home() {
     setError("");
     setTaskId(null);
     setState({ status: "", plan: "", findings: "", progress: "", summary: "" });
-    if (intervalRef.current) clearInterval(intervalRef.current);
+    eventSourceRef.current?.close();
     try {
       const res = await fetch("/api/agent", {
         method: "POST",
@@ -82,31 +115,49 @@ export default function Home() {
   useEffect(() => {
     if (!taskId) return;
 
-    const poll = async () => {
+    const TERMINAL = new Set(["completed", "failed", "cancelled"]);
+    const applySnapshot = (data: TaskState) => {
+      setState({
+        status: data.status,
+        error: data.error,
+        plan: data.plan,
+        findings: data.findings,
+        progress: data.progress,
+        summary: data.summary,
+        usage: data.usage,
+      });
+      if (TERMINAL.has(data.status)) {
+        eventSourceRef.current?.close();
+      }
+    };
+
+    // Live push over SSE — the server only sends a message when the task's
+    // on-disk state actually changes, so this reflects each planning/exec/
+    // verify step as it happens rather than waiting out a poll interval.
+    const es = new EventSource(`/api/agent/${taskId}/stream`);
+    eventSourceRef.current = es;
+
+    es.onmessage = (ev) => {
       try {
-        const res = await fetch(`/api/agent/${taskId}`);
-        if (!res.ok) return;
-        const data: TaskState = await res.json();
-        setState({
-          status: data.status,
-          error: data.error,
-          plan: data.plan,
-          findings: data.findings,
-          progress: data.progress,
-          summary: data.summary,
-        });
-        if (data.status === "completed" || data.status === "failed") {
-          if (intervalRef.current) clearInterval(intervalRef.current);
-        }
+        applySnapshot(JSON.parse(ev.data));
       } catch (err) {
         console.error(err);
       }
     };
 
-    poll();
-    intervalRef.current = setInterval(poll, 2000);
+    es.onerror = () => {
+      // The connection dropped before a terminal status arrived (the browser
+      // will keep retrying on its own); poll once immediately so the UI
+      // doesn't stall in the meantime.
+      fetch(`/api/agent/${taskId}`)
+        .then((res) => (res.ok ? res.json() : null))
+        .then((data) => data && applySnapshot(data))
+        .catch(() => {});
+    };
+
     return () => {
-      if (intervalRef.current) clearInterval(intervalRef.current);
+      es.close();
+      if (eventSourceRef.current === es) eventSourceRef.current = null;
     };
   }, [taskId]);
 
@@ -135,6 +186,26 @@ export default function Home() {
     a.download = `taskflow-summary-${taskId?.slice(0, 8) ?? "result"}.md`;
     a.click();
     URL.revokeObjectURL(url);
+  };
+
+  const [decisionPending, setDecisionPending] = useState(false);
+  const decide = async (action: "approve" | "reject") => {
+    if (!taskId || decisionPending) return;
+    setDecisionPending(true);
+    try {
+      const res = await fetch(`/api/agent/${taskId}/${action}`, { method: "POST" });
+      const data = await res.json();
+      if (res.ok) {
+        setState((s) => ({ ...s, status: data.status }));
+      } else {
+        setError(data.error || `Failed to ${action} the plan.`);
+      }
+    } catch (err) {
+      console.error(err);
+      setError("Could not reach the server. Please try again.");
+    } finally {
+      setDecisionPending(false);
+    }
   };
 
   return (
@@ -211,6 +282,19 @@ export default function Home() {
               ))}
             </div>
           )}
+
+          {!taskId && config && (
+            <p className="mt-3 text-xs text-gray-500">
+              Running on <span className="text-gray-300">{config.provider}</span>
+              {" · "}
+              <span className="text-gray-300">{config.model}</span>
+              {" · worst case "}
+              <span className="text-gray-300">{config.estimate.maxCalls} LLM calls</span>
+              {", up to "}
+              <span className="text-gray-300">{formatUsd(config.estimate.maxCostUsd)}</span>
+              {" (rough estimate, not a quote)"}
+            </p>
+          )}
         </section>
 
         {error && (
@@ -242,6 +326,12 @@ export default function Home() {
               <span className="text-xs text-gray-500">
                 Task <code className="bg-gray-900 px-1.5 py-0.5 rounded text-gray-400">{taskId.slice(0, 8)}</code>
               </span>
+              {state.usage && state.usage.calls > 0 && (
+                <span className="text-xs text-gray-500" title="Running token usage and estimated cost for this task">
+                  {state.usage.totalTokens.toLocaleString()} tokens · {formatUsd(state.usage.costUsd)}
+                  {config && ` of ~${formatUsd(config.estimate.maxCostUsd)} max`}
+                </span>
+              )}
             </div>
 
             {state.status === "failed" && (
@@ -256,6 +346,43 @@ export default function Home() {
                   </span>
                 ) : null}
               </div>
+            )}
+
+            {state.status === "cancelled" && (
+              <div className="mb-6 rounded-xl border border-gray-800 bg-gray-900/60 px-4 py-3 text-sm text-gray-400">
+                Plan rejected — no execution steps or tool calls were run for this task.
+              </div>
+            )}
+
+            {state.status === "awaiting_approval" && (
+              <section
+                role="alert"
+                className="mb-6 rounded-2xl border border-purple-800/50 bg-purple-950/20 p-5"
+              >
+                <h2 className="text-sm font-semibold text-purple-200 mb-2 flex items-center gap-2">
+                  <span>⏸</span> Review the plan before Taskflow runs it
+                </h2>
+                <p className="text-sm text-gray-400 mb-4">
+                  Execution and tool calls are paused until you approve. Reject to cancel
+                  without spending any more tokens.
+                </p>
+                <div className="flex gap-2">
+                  <button
+                    onClick={() => decide("approve")}
+                    disabled={decisionPending}
+                    className="inline-flex items-center gap-2 bg-purple-600 hover:bg-purple-500 disabled:bg-gray-800 disabled:text-gray-500 px-4 py-2 rounded-lg text-sm font-medium transition"
+                  >
+                    Approve & run
+                  </button>
+                  <button
+                    onClick={() => decide("reject")}
+                    disabled={decisionPending}
+                    className="inline-flex items-center gap-2 bg-gray-800 hover:bg-gray-700 disabled:text-gray-500 px-4 py-2 rounded-lg text-sm font-medium transition"
+                  >
+                    Reject
+                  </button>
+                </div>
+              </section>
             )}
 
             {/* Final output */}

@@ -1,5 +1,4 @@
 import { StateGraph, END, START } from "@langchain/langgraph";
-import { ChatOpenAI } from "@langchain/openai";
 import { HumanMessage, SystemMessage } from "@langchain/core/messages";
 import { AgentAnnotation, type AgentState } from "./state";
 import { MemoryFileManager } from "./memory";
@@ -7,25 +6,31 @@ import { buildTools, TOOL_NAMES } from "./tools";
 import { taskStore } from "../store";
 import { asText } from "./text";
 import type { ToolCall } from "./state";
+import { getLlm, activeModelName } from "./llm";
+import { MAX_PLAN_STEPS, MAX_STEP_ATTEMPTS, RECURSION_LIMIT } from "./limits";
 import { env } from "../env";
+import { createCheckpointer } from "./checkpointer";
+import { buildFindingsContext } from "./context";
 
-// --- Guardrails ------------------------------------------------------------
-// These bound total work (and therefore token spend) deterministically, which
-// is the single most common failure mode of autonomous agents: unbounded
-// loops and runaway API bills. The maximum number of LLM calls for a run is
-// 1 (plan) + MAX_PLAN_STEPS * MAX_STEP_ATTEMPTS * 2 (exec+verify) + 1 (summary).
-export const MAX_PLAN_STEPS = 12;
-export const MAX_STEP_ATTEMPTS = 2; // 1 initial try + up to 1 retry per step
-// LangGraph counts supersteps; set generously above the worst-case path so a
-// legitimate long run never trips it, while a runaway cycle still terminates.
-export const RECURSION_LIMIT =
-  2 + MAX_PLAN_STEPS * MAX_STEP_ATTEMPTS * 2 + 4;
+export { MAX_PLAN_STEPS, MAX_STEP_ATTEMPTS, RECURSION_LIMIT };
 
-function getLlm() {
-  return new ChatOpenAI({
-    model: env.openAiModel(),
-    temperature: 0,
-  });
+/**
+ * Checkpoints graph state so an interrupted run (plan-approval pause) can be
+ * resumed later with `agentApp.invoke(null, { configurable: { thread_id } })`.
+ * Persisted to a SQLite file (see checkpointer.ts) rather than kept
+ * in-memory, so a paused task survives a process restart and can be resumed
+ * by any process sharing the file — including across the `web`/`worker`
+ * split in durable-queue mode.
+ */
+export const checkpointer = createCheckpointer();
+
+/** Record token usage from an LLM response, if the provider reported any. */
+async function trackUsage(memory: MemoryFileManager, response: { usage_metadata?: unknown }) {
+  const usage = response.usage_metadata as
+    | { input_tokens: number; output_tokens: number; total_tokens: number }
+    | undefined;
+  if (!usage) return;
+  await memory.recordUsage(activeModelName(), usage);
 }
 
 async function planningNode(state: AgentState): Promise<Partial<AgentState>> {
@@ -42,6 +47,7 @@ async function planningNode(state: AgentState): Promise<Partial<AgentState>> {
     "Return ONLY the list, one step per line, starting with a dash and space."
   );
   const response = await llm.invoke([system, new HumanMessage(state.userInput)]);
+  await trackUsage(memory, response);
   const content = asText(response.content);
   const lines = content
     .split("\n")
@@ -53,12 +59,29 @@ async function planningNode(state: AgentState): Promise<Partial<AgentState>> {
   await memory.writePlan(lines);
   await memory.logProgress("Planning completed", `${lines.length} steps generated`);
 
+  // When plan approval is required, the graph interrupts right before the
+  // "planApproval" node — reflect that in status now, before the pause.
+  const needsApproval = env.requirePlanApproval() && lines.length > 0;
+  if (needsApproval) {
+    taskStore.set(state.taskId, "awaiting_approval");
+    await memory.writeStatus("awaiting_approval");
+    await memory.logProgress(
+      "Awaiting approval",
+      "Plan generated — waiting for approve/reject before execution begins"
+    );
+  }
+
   return {
     plan: lines,
     currentStepIndex: 0,
     stepAttempts: 0,
     messages: [response],
   };
+}
+
+/** No-op node whose only purpose is an `interruptBefore` target for plan approval. */
+async function planApprovalNode(): Promise<Partial<AgentState>> {
+  return {};
 }
 
 async function executionNode(state: AgentState): Promise<Partial<AgentState>> {
@@ -80,9 +103,11 @@ async function executionNode(state: AgentState): Promise<Partial<AgentState>> {
   const system = new SystemMessage(
     "You are an execution agent. Complete the current step. " +
       "Call a tool when it helps; otherwise reply with the result as plain text. " +
-      `Current step: ${step}`
+      `Current step: ${step}` +
+      buildFindingsContext(state.findings)
   );
   const response = await llm.invoke([system, new HumanMessage(step)]);
+  await trackUsage(memory, response);
 
   const calls = response.tool_calls ?? [];
   const recordedCalls: ToolCall[] = [];
@@ -148,6 +173,7 @@ async function verificationNode(state: AgentState): Promise<Partial<AgentState>>
     system,
     new HumanMessage(`Step: ${step}\nResult: ${lastResult}`),
   ]);
+  await trackUsage(memory, response);
   const verdict = asText(response.content);
   // Objective parse: look at the leading token, not a substring match anywhere.
   const leading = verdict.trim().toUpperCase();
@@ -211,6 +237,7 @@ async function summaryNode(state: AgentState): Promise<Partial<AgentState>> {
       `Original request:\n${state.userInput}\n\nFindings:\n${state.findings.join("\n\n")}`
     );
     const response = await llm.invoke([system, human]);
+    await trackUsage(memory, response);
     finalOutput = asText(response.content);
   }
 
@@ -229,17 +256,28 @@ function routeAfterStep(state: AgentState): "execution" | "summary" {
   return "summary";
 }
 
+// Empty plans always skip straight to summary. A non-empty plan goes through
+// the one-time "planApproval" checkpoint only when REQUIRE_PLAN_APPROVAL is
+// on; otherwise it proceeds straight to execution, preserving the default
+// run-to-completion experience.
+function routeAfterPlanning(state: AgentState): "planApproval" | "execution" | "summary" {
+  if (state.plan.length === 0) return "summary";
+  return env.requirePlanApproval() ? "planApproval" : "execution";
+}
+
 const workflow = new StateGraph(AgentAnnotation)
   .addNode("planning", planningNode)
+  .addNode("planApproval", planApprovalNode)
   .addNode("execution", executionNode)
   .addNode("verification", verificationNode)
   .addNode("summary", summaryNode)
   .addEdge(START, "planning")
-  // Empty plans route straight to summary instead of dead-ending in "running".
-  .addConditionalEdges("planning", routeAfterStep, {
+  .addConditionalEdges("planning", routeAfterPlanning, {
+    planApproval: "planApproval",
     execution: "execution",
     summary: "summary",
   })
+  .addEdge("planApproval", "execution")
   .addEdge("execution", "verification")
   .addConditionalEdges("verification", routeAfterStep, {
     execution: "execution",
@@ -247,4 +285,11 @@ const workflow = new StateGraph(AgentAnnotation)
   })
   .addEdge("summary", END);
 
-export const agentApp = workflow.compile();
+// `interruptBefore: ["planApproval"]` only takes effect on runs that reach
+// that node (see routeAfterPlanning above) — the checkpointer is required by
+// LangGraph for any interrupt to work, so it's always attached; runs that
+// never pause simply never touch it.
+export const agentApp = workflow.compile({
+  checkpointer,
+  interruptBefore: ["planApproval"],
+});

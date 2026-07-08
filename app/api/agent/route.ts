@@ -1,23 +1,37 @@
 import { NextRequest, NextResponse } from "next/server";
 import { randomUUID } from "crypto";
-import { agentApp, RECURSION_LIMIT } from "../../../lib/agent/graph";
 import { AgentState } from "../../../lib/agent/state";
 import { MemoryFileManager } from "../../../lib/agent/memory";
+import { runTask } from "../../../lib/agent/run";
 import { taskStore } from "../../../lib/store";
 import { isValidTaskId } from "../../../lib/taskId";
 import { env } from "../../../lib/env";
+import { checkRateLimit, clientKeyFromHeaders } from "../../../lib/rateLimit";
 
 export const maxDuration = 60;
 
 export async function POST(req: NextRequest) {
   try {
-    if (!env.openAiApiKey()) {
+    if (!env.hasAnyLlmKey()) {
       return NextResponse.json(
         {
           error:
-            "Missing OPENAI_API_KEY. Set it in your environment (e.g. .env.local) before starting a task.",
+            "Missing an LLM API key. Set OPENAI_API_KEY or ANTHROPIC_API_KEY in your environment (e.g. .env.local) before starting a task.",
         },
         { status: 500 }
+      );
+    }
+
+    const rateLimit = checkRateLimit(clientKeyFromHeaders(req.headers));
+    if (!rateLimit.allowed) {
+      const retryAfterSec = Math.ceil((rateLimit.retryAfterMs ?? 0) / 1000);
+      return NextResponse.json(
+        {
+          error: `Rate limit exceeded (${rateLimit.limit} tasks per ${Math.round(
+            env.rateLimitWindowMs() / 60000
+          )} min). Try again in ${retryAfterSec}s.`,
+        },
+        { status: 429, headers: { "Retry-After": String(retryAfterSec) } }
       );
     }
 
@@ -53,21 +67,7 @@ export async function POST(req: NextRequest) {
       error: undefined,
     };
 
-    agentApp
-      .invoke(initialState, { recursionLimit: RECURSION_LIMIT })
-      .catch(async (err) => {
-        console.error(`Agent error for task ${taskId}:`, err);
-        taskStore.set(taskId, "failed");
-        try {
-          await memory.init();
-          await memory.writeStatus(
-            "failed",
-            err instanceof Error ? err.message : String(err)
-          );
-        } catch (writeErr) {
-          console.error("Failed to persist failure status:", writeErr);
-        }
-      });
+    runTask(initialState);
 
     return NextResponse.json({ taskId, status: "started" });
   } catch (error) {
